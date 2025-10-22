@@ -1,13 +1,9 @@
 /**
- * Razorpay Appwrite Function - index.js
+ * index.js - Razorpay / Appwrite function
  *
- * Robust universal handler that handles Appwrite's various execution payload shapes:
- * - wrapper object: { req: { body, bodyJson, bodyText, ... }, res: {} }
- * - direct (req, res)
- * - single-arg raw body
- * - uses APPWRITE_FUNCTION_DATA fallback
+ * Replaces previous function: robust parsing, verbose logs, and canonical response.
  *
- * Required env vars (set in Function settings):
+ * Required environment variables:
  * - RAZORPAY_KEY_ID
  * - RAZORPAY_KEY_SECRET
  * - APPWRITE_ENDPOINT
@@ -23,10 +19,7 @@ const crypto = require("crypto");
 
 const env = process.env;
 
-/* -------------------------
-   Helpers
-   ------------------------- */
-
+/* Utilities */
 function checkEnv() {
   const required = [
     "RAZORPAY_KEY_ID",
@@ -38,126 +31,140 @@ function checkEnv() {
     "APPWRITE_ORDERS_COLLECTION_ID",
   ];
   const missing = required.filter((k) => !env[k]);
-  if (missing.length) throw new Error(missing.join(", "));
+  if (missing.length) throw new Error("Missing env: " + missing.join(", "));
 }
 
-function jsonSafeParse(s) {
-  try { return typeof s === "string" ? JSON.parse(s) : s; } catch { return s; }
+function tryParseJSON(s) {
+  if (typeof s !== "string") return null;
+  try { return JSON.parse(s); } catch { return null; }
 }
 
-function tryParseJSON(str) {
-  if (typeof str !== "string") return null;
-  try { return JSON.parse(str); } catch { return null; }
-}
-
-function bufferToString(bufObj) {
-  // bufObj is likely { type: 'Buffer', data: [..] }
-  try {
-    if (!bufObj || !Array.isArray(bufObj.data)) return null;
-    return Buffer.from(bufObj.data).toString("utf8");
-  } catch (e) {
-    return null;
-  }
+function bufferToString(obj) {
+  if (!obj || !Array.isArray(obj.data)) return null;
+  try { return Buffer.from(obj.data).toString("utf8"); } catch { return null; }
 }
 
 function getAppwrite() {
   const client = new Client();
-  client
-    .setEndpoint(env.APPWRITE_ENDPOINT)
-    .setProject(env.APPWRITE_PROJECT)
-    .setKey(env.APPWRITE_API_KEY);
-  return { client, databases: new Databases(client) };
+  client.setEndpoint(env.APPWRITE_ENDPOINT).setProject(env.APPWRITE_PROJECT).setKey(env.APPWRITE_API_KEY);
+  const databases = new Databases(client);
+  return { client, databases };
+}
+
+function toPaise(amount) {
+  // If amount looks already in paise (big number) we don't multiply; but the server always expects paise
+  const n = Number(amount ?? 0);
+  if (Number.isNaN(n)) return 0;
+  // If it's clearly rupees and <= 1e6, convert to paise
+  if (n > 0 && n < 1e6 && Math.abs(n - Math.round(n)) < 1e-9) {
+    // treat as rupees -> paise
+    return Math.round(n * 100);
+  }
+  // otherwise return as paise
+  return Math.round(n);
 }
 
 function generateSignature(orderId, paymentId, secret) {
-  const hmac = crypto.createHmac("sha256", secret);
-  hmac.update(`${orderId}|${paymentId}`);
-  return hmac.digest("hex");
+  const h = crypto.createHmac("sha256", secret);
+  h.update(`${orderId}|${paymentId}`);
+  return h.digest("hex");
 }
 
-function toPaise(amountNumber) {
-  return Math.round(Number(amountNumber) * 100);
-}
-
-/* -------------------------
-   Actions
-   ------------------------- */
-
+/* Action: createOrder */
 async function createOrderAction(payload) {
-  const { items = [], userId, shippingAddress = {}, currency = "INR", receiptPrefix = "rcpt_" } = payload;
-  const subtotal = Number(payload.subtotal ?? 0);
-  const total = Number(payload.totalAmount ?? subtotal);
-
+  // payload: { userId, items, shippingAddress, subtotal, totalAmount, currency }
+  const { userId } = payload || {};
   if (!userId) return { ok: false, error: "userId required" };
 
+  const items = payload.items ?? [];
+  const shippingAddress = payload.shippingAddress ?? {};
+  const currency = payload.currency ?? "INR";
+  const subtotal = payload.subtotal ?? 0;
+  const total = payload.totalAmount ?? subtotal;
+
+  // Initialize Razorpay
   const razorpay = new Razorpay({
     key_id: env.RAZORPAY_KEY_ID,
     key_secret: env.RAZORPAY_KEY_SECRET,
   });
 
-  const amountPaise = toPaise(total || subtotal || 0);
-  if (!amountPaise || amountPaise <= 0) return { ok: false, error: "Invalid amount" };
+  // amount in paise expected by Razorpay
+  const amountPaise = toPaise(total);
+  if (!amountPaise || amountPaise <= 0) {
+    return { ok: false, error: "Invalid amount" };
+  }
 
-  const orderOptions = {
-    amount: amountPaise,
-    currency,
-    receipt: `${receiptPrefix}${Date.now()}`,
-    partial_payment: false
-  };
-
+  // Create Razorpay order
   let rOrder;
   try {
+    const orderOptions = {
+      amount: amountPaise,
+      currency,
+      receipt: `rcpt_${Date.now()}`,
+      partial_payment: false,
+    };
+    console.log("Razorpay create order options:", orderOptions);
     rOrder = await razorpay.orders.create(orderOptions);
+    console.log("Razorpay order created:", rOrder && rOrder.id ? { id: rOrder.id, status: rOrder.status } : rOrder);
   } catch (err) {
-    console.error("Razorpay order create error:", err);
+    console.error("Razorpay order create error:", err && err.message ? err.message : err);
     return { ok: false, error: "Razorpay order creation failed: " + (err?.message || String(err)) };
   }
 
+  if (!rOrder || !rOrder.id) {
+    console.error("Razorpay order missing id:", rOrder);
+    return { ok: false, error: "Razorpay did not return an order id" };
+  }
+
+  // Save order into Appwrite DB
   try {
     const { databases } = getAppwrite();
-    const createPayload = {
+    const docPayload = {
       userId,
-      items: JSON.stringify(items),
+      items: typeof items === "string" ? items : JSON.stringify(items),
       subtotal: Number(subtotal),
       totalAmount: Number(total),
       currency,
-      shippingAddress: JSON.stringify(shippingAddress),
+      shippingAddress: typeof shippingAddress === "string" ? shippingAddress : JSON.stringify(shippingAddress),
       paymentStatus: "created",
       paymentProvider: "razorpay",
       paymentReference: null,
       razorpayOrderId: rOrder.id,
       razorpayOrderObj: JSON.stringify(rOrder),
       razorpayPaymentId: null,
-      razorpaySignature: null
+      razorpaySignature: null,
+      razorpayKeyId: env.RAZORPAY_KEY_ID || null, // store key id (non-secret)
     };
 
-    console.log("createPayload:", createPayload);
+    console.log("Creating Appwrite document with payload:", { ...docPayload, razorpayOrderObj: "[omitted]" });
 
     const doc = await databases.createDocument(
       env.APPWRITE_DATABASE_ID,
       env.APPWRITE_ORDERS_COLLECTION_ID,
       ID.unique(),
-      createPayload
+      docPayload
     );
 
-    console.log("createDocument response:", doc);
+    console.log("Appwrite createDocument result:", { $id: doc.$id });
 
+    // Return canonical response the client expects
     return {
       ok: true,
       orderId: doc.$id,
       razorpayOrderId: rOrder.id,
       amount: amountPaise,
       currency,
-      razorpayKeyId: env.RAZORPAY_KEY_ID
+      razorpayKeyId: env.RAZORPAY_KEY_ID || null,
     };
   } catch (err) {
-    console.error("Appwrite createDocument error:", err);
+    console.error("Appwrite createDocument error:", err && err.message ? err.message : err);
     return { ok: false, error: "Appwrite save order failed: " + (err?.message || String(err)) };
   }
 }
 
+/* Action: verifyPayment */
 async function verifyPaymentAction(payload) {
-  const { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature } = payload;
+  const { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature } = payload || {};
   if (!orderId || !razorpayPaymentId || !razorpayOrderId || !razorpaySignature) {
     return { ok: false, error: "Missing verification fields" };
   }
@@ -169,148 +176,121 @@ async function verifyPaymentAction(payload) {
 
   try {
     const { databases } = getAppwrite();
-    const updatePayload = {
+    const update = {
       paymentStatus: "paid",
       paymentReference: razorpayPaymentId,
       razorpayPaymentId,
-      razorpaySignature
+      razorpaySignature,
     };
 
     const updated = await databases.updateDocument(
       env.APPWRITE_DATABASE_ID,
       env.APPWRITE_ORDERS_COLLECTION_ID,
       orderId,
-      updatePayload
+      update
     );
 
-    console.log("updateDocument response:", updated);
-
-    return { ok: true, orderId: updated.$id, razorpayPaymentId, message: "Payment verified and order updated" };
+    console.log("Appwrite updateDocument success:", { $id: updated.$id });
+    return { ok: true, orderId: updated.$id, razorpayPaymentId, message: "Payment verified" };
   } catch (err) {
     console.error("Appwrite updateDocument error:", err);
     return { ok: false, error: "Failed to update order: " + (err?.message || String(err)) };
   }
 }
 
+/* Determine action and route to appropriate handler */
 async function handleAction(body) {
   const actionFromBody = (body && (body.action || (body.payload && body.payload.action))) || null;
   const payload = (body && body.payload) || body || {};
 
-  const act = (actionFromBody || payload.action || (payload.razorpayPaymentId ? "verifyPayment" : "createOrder") || "createOrder").toString().toLowerCase();
+  const act =
+    (actionFromBody ||
+      payload.action ||
+      (payload.razorpayPaymentId ? "verifyPayment" : "createOrder") ||
+      "createOrder"
+    )
+      .toString()
+      .toLowerCase();
 
-  if (act === "createorder") return await createOrderAction(payload);
+  if (act === "createorder" || act === "createorder") return await createOrderAction(payload);
   if (act === "verifypayment") return await verifyPaymentAction(payload);
 
   if (payload.razorpayPaymentId) return await verifyPaymentAction(payload);
   return await createOrderAction(payload);
 }
 
-/* -------------------------
-   Robust input parsing + universal handler
-   ------------------------- */
-
+/* Robust input parsing for various Appwrite shapes */
 async function runHandler(rawArg, rawRes) {
-  // log entry briefly
-  try {
-    console.log("=== runHandler entry ===");
-  } catch (e) {}
+  console.log("=== runHandler start ===");
 
+  // unwrap wrapper { req: {...}, res: {...} }
   let req = rawArg;
   let res = rawRes;
-
-  // Unwrap Appwrite wrapper: sometimes Appwrite passes { req: {...}, res: {...} }
   if (req && typeof req === "object" && req.req && typeof req.req === "object") {
-    // often rawArg looks like { req: { body: "...", bodyJson: {...}, ... }, res: {} }
     req = req.req;
-    // res may be rawArg.res
     res = rawArg.res || res;
+    console.log("Unwrapped wrapper: using req = rawArg.req");
   }
 
-  // Edge: if Appwrite passed (req, res) typical, we keep as-is.
-
-  // Validate env early
-  try { checkEnv(); } catch (err) {
-    const out = { ok: false, error: "Missing environment variables: " + (err.message || String(err)) };
+  // validate env
+  try {
+    checkEnv();
+  } catch (err) {
+    console.error("ENV missing:", err.message || err);
+    const out = { ok: false, error: "Missing env vars: " + (err.message || String(err)) };
     if (res && typeof res.status === "function") return res.status(500).json(out);
-    console.error("ENV ERROR:", err);
     console.log(JSON.stringify(out));
     return out;
   }
 
-  // Try to resolve input payload from many possible shapes
+  // parse input
   let input = {};
-
   try {
-    // 1) If request already has parsed bodyJson (Appwrite sometimes provides this)
     if (req && req.bodyJson && typeof req.bodyJson === "object") {
       input = req.bodyJson;
-      console.log("input <- req.bodyJson");
-    }
-    // 2) If req.body is an object (already parsed)
-    else if (req && req.body && typeof req.body === "object") {
+      console.log("Input <- req.bodyJson");
+    } else if (req && req.body && typeof req.body === "object") {
       input = req.body;
-      console.log("input <- req.body (object)");
-    }
-    // 3) If req.body is a string that contains JSON
-    else if (req && req.body && typeof req.body === "string") {
-      const parsed = tryParseJSON(req.body);
-      if (parsed) { input = parsed; console.log("input <- parsed req.body string"); }
-      else { console.log("req.body string exists but JSON.parse failed"); }
-    }
-    // 4) If req.bodyText exists (string)
-    else if (req && req.bodyText && typeof req.bodyText === "string") {
+      console.log("Input <- req.body (object)");
+    } else if (req && req.body && typeof req.body === "string") {
+      const p = tryParseJSON(req.body);
+      if (p) { input = p; console.log("Input <- parsed req.body string"); } else console.log("req.body string present but parse failed");
+    } else if (req && req.bodyText && typeof req.bodyText === "string") {
       const p = tryParseJSON(req.bodyText);
-      if (p) { input = p; console.log("input <- parsed req.bodyText"); }
-      else { console.log("req.bodyText present but parse failed"); }
-    }
-    // 5) If req.bodyRaw exists and is string
-    else if (req && req.bodyRaw && typeof req.bodyRaw === "string") {
+      if (p) { input = p; console.log("Input <- parsed req.bodyText"); } else console.log("req.bodyText parse failed");
+    } else if (req && req.bodyRaw && typeof req.bodyRaw === "string") {
       const p = tryParseJSON(req.bodyRaw);
-      if (p) { input = p; console.log("input <- parsed req.bodyRaw"); }
-    }
-    // 6) If req.bodyBinary provided (Buffer-like)
-    else if (req && req.bodyBinary && req.bodyBinary.data && Array.isArray(req.bodyBinary.data)) {
+      if (p) { input = p; console.log("Input <- parsed req.bodyRaw"); }
+    } else if (req && req.bodyBinary && req.bodyBinary.data) {
       const s = bufferToString(req.bodyBinary);
       const p = tryParseJSON(s);
-      if (p) { input = p; console.log("input <- parsed bodyBinary -> string"); }
-    }
-    // 7) If top-level rawArg was a string (very rare)
-    else if (typeof rawArg === "string") {
-      const p = tryParseJSON(rawArg);
-      if (p) { input = p; console.log("input <- parsed rawArg string"); }
-    }
-    // 8) If APPWRITE_FUNCTION_DATA provided
-    else if (process.env.APPWRITE_FUNCTION_DATA) {
+      if (p) { input = p; console.log("Input <- parsed bodyBinary"); }
+    } else if (process.env.APPWRITE_FUNCTION_DATA) {
       const p = tryParseJSON(process.env.APPWRITE_FUNCTION_DATA);
       input = p ? p : process.env.APPWRITE_FUNCTION_DATA;
-      console.log("input <- APPWRITE_FUNCTION_DATA fallback");
-    }
-    // 9) If none of the above, maybe req itself contains payload fields (rare)
-    else if (req && (req.action || req.payload || req.userId)) {
-      input = req;
-      console.log("input <- req as fallback");
+      console.log("Input <- APPWRITE_FUNCTION_DATA");
+    } else if (typeof rawArg === "string") {
+      const p = tryParseJSON(rawArg);
+      if (p) { input = p; console.log("Input <- rawArg string"); }
     } else {
-      input = {};
-      console.log("input <- empty fallback");
+      input = req || {};
+      console.log("Input <- fallback req");
     }
   } catch (e) {
-    console.error("Error resolving input:", e);
+    console.error("Failed to parse input:", e);
     input = {};
   }
 
-  // Log final input for debugging (Appwrite captures stdout)
-  try { console.log("FINAL input:", JSON.stringify(input)); } catch (e) { console.log("FINAL input (non-serializable)"); }
+  try {
+    console.log("FINAL input preview:", JSON.stringify(input).slice(0, 200));
+  } catch (e) { console.log("FINAL input (non-serializable)"); }
 
-  // Execute requested action
   try {
     const result = await handleAction(input);
-
     if (res && typeof res.status === "function") {
       if (result && result.ok === false) return res.status(400).json(result);
       return res.status(200).json(result);
     }
-
-    // No res available — print result for Executions UI and return it
     console.log(JSON.stringify(result));
     return result;
   } catch (err) {
@@ -322,17 +302,16 @@ async function runHandler(rawArg, rawRes) {
   }
 }
 
-/* Export handler for Appwrite */
+/* Export & local debug */
 module.exports = async function (req, res) {
   return runHandler(req, res);
 };
 
-/* Local-run fallback for debugging */
 if (require.main === module) {
   (async () => {
     try {
       const raw = process.env.APPWRITE_FUNCTION_DATA || "{}";
-      const body = jsonSafeParse(raw);
+      const body = tryParseJSON(raw) || {};
       const out = await handleAction(body);
       console.log(JSON.stringify(out, null, 2));
     } catch (e) {
