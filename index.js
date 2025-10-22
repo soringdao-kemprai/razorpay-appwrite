@@ -1,10 +1,12 @@
 /**
- * index.js - Appwrite Function (Node 18)
+ * Razorpay Appwrite Function - index.js
  *
- * Exports an HTTP handler for Appwrite to call.
- * Also supports running via APPWRITE_FUNCTION_DATA (legacy).
+ * Exports a universal handler for Appwrite functions.
+ * Supports both:
+ * - Appwrite HTTP style: (req, res)
+ * - Appwrite single-arg execution: module called with a single body object
  *
- * Required environment variables in Function settings:
+ * Required environment variables (set in Function settings):
  * - RAZORPAY_KEY_ID
  * - RAZORPAY_KEY_SECRET
  * - APPWRITE_ENDPOINT
@@ -13,9 +15,31 @@
  * - APPWRITE_DATABASE_ID
  * - APPWRITE_ORDERS_COLLECTION_ID
  *
- * Usage:
- * - Appwrite will call this as an HTTP handler.
- * - Or you can run locally with APPWRITE_FUNCTION_DATA set to a JSON string.
+ * Use `functions.createExecution(functionId, JSON.stringify(payload))` from frontend,
+ * where payload = { action: "createOrder" | "verifyPayment", payload: {...} }
+ *
+ * Example createOrder payload:
+ * {
+ *   "action": "createOrder",
+ *   "payload": {
+ *     "userId": "user_123",
+ *     "items": [{ "productId": "p1", "quantity": 1 }],
+ *     "shippingAddress": { "text": "addr", "phone":"9999999999" },
+ *     "subtotal": 100,
+ *     "totalAmount": 100
+ *   }
+ * }
+ *
+ * Example verifyPayment payload:
+ * {
+ *   "action": "verifyPayment",
+ *   "payload": {
+ *     "orderId": "appwrite_doc_id",
+ *     "razorpayPaymentId": "pay_XXXX",
+ *     "razorpayOrderId": "order_XXXX",
+ *     "razorpaySignature": "signature_hex"
+ *   }
+ * }
  */
 
 const { Client, Databases, ID } = require("node-appwrite");
@@ -23,6 +47,10 @@ const Razorpay = require("razorpay");
 const crypto = require("crypto");
 
 const env = process.env;
+
+/* -------------------------
+   Helper utilities
+   ------------------------- */
 
 function checkEnv() {
   const required = [
@@ -35,7 +63,7 @@ function checkEnv() {
     "APPWRITE_ORDERS_COLLECTION_ID",
   ];
   const missing = required.filter((k) => !env[k]);
-  if (missing.length) throw new Error("Missing environment variables: " + missing.join(", "));
+  if (missing.length) throw new Error(missing.join(", "));
 }
 
 function jsonSafeParse(s) {
@@ -58,11 +86,16 @@ function generateSignature(orderId, paymentId, secret) {
 }
 
 function toPaise(amountNumber) {
+  // amountNumber expected in rupees; returns integer paise
   return Math.round(Number(amountNumber) * 100);
 }
 
-/* Action implementations */
+/* -------------------------
+   Action implementations
+   ------------------------- */
+
 async function createOrderAction(payload) {
+  // payload: { items, userId, shippingAddress, subtotal, totalAmount, currency }
   const { items = [], userId, shippingAddress = {}, currency = "INR", receiptPrefix = "rcpt_" } = payload;
   const subtotal = Number(payload.subtotal ?? 0);
   const total = Number(payload.totalAmount ?? subtotal);
@@ -75,13 +108,23 @@ async function createOrderAction(payload) {
   });
 
   const amountPaise = toPaise(total || subtotal || 0);
+  if (!amountPaise || amountPaise <= 0) return { ok: false, error: "Invalid amount" };
 
-  const orderOptions = { amount: amountPaise, currency, receipt: `${receiptPrefix}${Date.now()}`, partial_payment: false };
+  const orderOptions = {
+    amount: amountPaise,
+    currency,
+    receipt: `${receiptPrefix}${Date.now()}`,
+    partial_payment: false
+  };
 
   let rOrder;
-  try { rOrder = await razorpay.orders.create(orderOptions); }
-  catch (err) { return { ok: false, error: "Razorpay order creation failed: " + (err.message || err) }; }
+  try {
+    rOrder = await razorpay.orders.create(orderOptions);
+  } catch (err) {
+    return { ok: false, error: "Razorpay order creation failed: " + (err?.message || String(err)) };
+  }
 
+  // Save to Appwrite
   try {
     const { databases } = getAppwrite();
     const createPayload = {
@@ -107,24 +150,33 @@ async function createOrderAction(payload) {
       createPayload
     );
 
-    return { ok: true, orderId: doc.$id, razorpayOrderId: rOrder.id, amount: amountPaise, currency, razorpayKeyId: env.RAZORPAY_KEY_ID };
+    return {
+      ok: true,
+      orderId: doc.$id,
+      razorpayOrderId: rOrder.id,
+      amount: amountPaise,
+      currency,
+      razorpayKeyId: env.RAZORPAY_KEY_ID
+    };
   } catch (err) {
-    return { ok: false, error: "Appwrite save order failed: " + (err.message || err) };
+    return { ok: false, error: "Appwrite save order failed: " + (err?.message || String(err)) };
   }
 }
 
 async function verifyPaymentAction(payload) {
+  // payload: { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature }
   const { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature } = payload;
   if (!orderId || !razorpayPaymentId || !razorpayOrderId || !razorpaySignature) {
     return { ok: false, error: "Missing verification fields" };
   }
 
   const expected = generateSignature(razorpayOrderId, razorpayPaymentId, env.RAZORPAY_KEY_SECRET);
-  if (expected !== razorpaySignature) return { ok: false, error: "Invalid signature" };
+  if (expected !== razorpaySignature) {
+    return { ok: false, error: "Invalid signature" };
+  }
 
   try {
     const { databases } = getAppwrite();
-
     const updatePayload = {
       paymentStatus: "paid",
       paymentReference: razorpayPaymentId,
@@ -141,64 +193,103 @@ async function verifyPaymentAction(payload) {
 
     return { ok: true, orderId: updated.$id, razorpayPaymentId, message: "Payment verified and order updated" };
   } catch (err) {
-    return { ok: false, error: "Failed to update order: " + (err.message || err) };
+    return { ok: false, error: "Failed to update order: " + (err?.message || String(err)) };
   }
 }
 
-/* Main executor: determines action and runs it */
+/* decide which action to run */
 async function handleAction(body) {
-  // body may be: { action, payload } or payload directly
-  const actionName = (body && (body.action || body?.payload?.action)) || (body?.payload?.action) || null;
+  // support multiple shapes: { action, payload } or { payload: { ... } } or raw payload
+  const actionFromBody = (body && (body.action || (body.payload && body.payload.action))) || null;
   const payload = (body && body.payload) || body || {};
-  const act = (body.action || payload.action || (payload.razorpayPaymentId ? "verifyPayment" : "createOrder") || "createOrder").toString().toLowerCase();
 
-  if (act === "createorder" || act === "createorder") return await createOrderAction(payload);
-  if (act === "verifypayment" || act === "verifypayment") return await verifyPaymentAction(payload);
+  // normalize action string
+  const act = (actionFromBody || payload.action || (payload.razorpayPaymentId ? "verifyPayment" : "createOrder") || "createOrder").toString().toLowerCase();
 
-  // catch-all: guess based on fields
+  if (act === "createorder" || act === "createorder") {
+    return await createOrderAction(payload);
+  }
+  if (act === "verifypayment" || act === "verifypayment") {
+    return await verifyPaymentAction(payload);
+  }
+
+  // fallback by guessing fields
   if (payload.razorpayPaymentId) return await verifyPaymentAction(payload);
   return await createOrderAction(payload);
 }
 
-/* Exported HTTP handler Appwrite will call */
-module.exports = async function (req, res) {
+/* -------------------------
+   Universal handler
+   ------------------------- */
+
+async function runHandler(reqArg, resArg) {
+  let req = reqArg;
+  let res = resArg;
+
+  // If Appwrite passes a single object without headers/body, treat that as the body payload
+  if (!res && reqArg && typeof reqArg === "object" && !("headers" in reqArg) && !("body" in reqArg)) {
+    req = { body: reqArg };
+  }
+
   try {
     checkEnv();
   } catch (err) {
-    console.error("ENV ERROR:", err.message || err);
-    res.status(500).json({ ok: false, error: err.message || String(err) });
-    return;
+    const out = { ok: false, error: "Missing environment variables: " + (err.message || String(err)) };
+    if (res && typeof res.status === "function") {
+      return res.status(500).json(out);
+    }
+    console.error("ENV ERROR:", err);
+    console.log(JSON.stringify(out));
+    return out;
   }
 
-  // Accept input from either HTTP request body (Appwrite) or old APPWRITE_FUNCTION_DATA
+  // Resolve input from possible sources
   let input = {};
-  if (req && req.body && Object.keys(req.body).length > 0) {
-    input = req.body;
-  } else if (process.env.APPWRITE_FUNCTION_DATA) {
-    try { input = JSON.parse(process.env.APPWRITE_FUNCTION_DATA); } catch { input = process.env.APPWRITE_FUNCTION_DATA; }
+  try {
+    if (req && req.body && Object.keys(req.body).length > 0) {
+      input = req.body;
+    } else if (process.env.APPWRITE_FUNCTION_DATA) {
+      try { input = JSON.parse(process.env.APPWRITE_FUNCTION_DATA); } catch { input = process.env.APPWRITE_FUNCTION_DATA; }
+    } else if (req && Object.keys(req).length > 0) {
+      input = req;
+    } else {
+      input = {};
+    }
+  } catch (e) {
+    input = {};
   }
 
   try {
     const result = await handleAction(input);
-    // If result is object, respond with JSON and 200/400
-    if (result && result.ok === false) {
-      res.status(400).json(result);
-    } else {
-      res.status(200).json(result);
+
+    if (res && typeof res.status === "function") {
+      if (result && result.ok === false) return res.status(400).json(result);
+      return res.status(200).json(result);
     }
+
+    // No res -> log & return
+    console.log(JSON.stringify(result));
+    return result;
   } catch (err) {
     console.error("ACTION ERROR:", err);
-    res.status(500).json({ ok: false, error: err.message || String(err) });
+    const out = { ok: false, error: err.message || String(err) };
+    if (res && typeof res.status === "function") {
+      return res.status(500).json(out);
+    }
+    console.log(JSON.stringify(out));
+    return out;
   }
+}
+
+/* export handler for Appwrite */
+module.exports = async function (req, res) {
+  return runHandler(req, res);
 };
 
-/* Also allow running locally with APPWRITE_FUNCTION_DATA (node index.js won't be called by Appwrite),
-   but Appwrite won't call this path — it uses exported handler above. */
+/* local debugging if run as script */
 if (require.main === module) {
-  // Running as standalone script (not exported). Useful for local debugging:
   (async () => {
     try {
-      checkEnv();
       const raw = process.env.APPWRITE_FUNCTION_DATA || "{}";
       const body = jsonSafeParse(raw);
       const out = await handleAction(body);
