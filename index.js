@@ -1,8 +1,6 @@
 /**
  * index.js - Razorpay / Appwrite function
  *
- * Replaces previous function: robust parsing, verbose logs, and canonical response.
- *
  * Required environment variables:
  * - RAZORPAY_KEY_ID
  * - RAZORPAY_KEY_SECRET
@@ -52,15 +50,11 @@ function getAppwrite() {
 }
 
 function toPaise(amount) {
-  // If amount looks already in paise (big number) we don't multiply; but the server always expects paise
   const n = Number(amount ?? 0);
   if (Number.isNaN(n)) return 0;
-  // If it's clearly rupees and <= 1e6, convert to paise
   if (n > 0 && n < 1e6 && Math.abs(n - Math.round(n)) < 1e-9) {
-    // treat as rupees -> paise
     return Math.round(n * 100);
   }
-  // otherwise return as paise
   return Math.round(n);
 }
 
@@ -72,7 +66,6 @@ function generateSignature(orderId, paymentId, secret) {
 
 /* Action: createOrder */
 async function createOrderAction(payload) {
-  // payload: { userId, items, shippingAddress, subtotal, totalAmount, currency }
   const { userId } = payload || {};
   if (!userId) return { ok: false, error: "userId required" };
 
@@ -82,19 +75,16 @@ async function createOrderAction(payload) {
   const subtotal = payload.subtotal ?? 0;
   const total = payload.totalAmount ?? subtotal;
 
-  // Initialize Razorpay
   const razorpay = new Razorpay({
     key_id: env.RAZORPAY_KEY_ID,
     key_secret: env.RAZORPAY_KEY_SECRET,
   });
 
-  // amount in paise expected by Razorpay
   const amountPaise = toPaise(total);
   if (!amountPaise || amountPaise <= 0) {
     return { ok: false, error: "Invalid amount" };
   }
 
-  // Create Razorpay order
   let rOrder;
   try {
     const orderOptions = {
@@ -116,7 +106,6 @@ async function createOrderAction(payload) {
     return { ok: false, error: "Razorpay did not return an order id" };
   }
 
-  // Save order into Appwrite DB
   try {
     const { databases } = getAppwrite();
     const docPayload = {
@@ -133,7 +122,7 @@ async function createOrderAction(payload) {
       razorpayOrderObj: JSON.stringify(rOrder),
       razorpayPaymentId: null,
       razorpaySignature: null,
-      razorpayKeyId: env.RAZORPAY_KEY_ID || null, // store key id (non-secret)
+      razorpayKeyId: env.RAZORPAY_KEY_ID || null,
     };
 
     console.log("Creating Appwrite document with payload:", { ...docPayload, razorpayOrderObj: "[omitted]" });
@@ -147,7 +136,6 @@ async function createOrderAction(payload) {
 
     console.log("Appwrite createDocument result:", { $id: doc.$id });
 
-    // Return canonical response the client expects
     return {
       ok: true,
       orderId: doc.$id,
@@ -223,7 +211,6 @@ async function handleAction(body) {
 async function runHandler(rawArg, rawRes) {
   console.log("=== runHandler start ===");
 
-  // unwrap wrapper { req: {...}, res: {...} }
   let req = rawArg;
   let res = rawRes;
   if (req && typeof req === "object" && req.req && typeof req.req === "object") {
@@ -232,7 +219,6 @@ async function runHandler(rawArg, rawRes) {
     console.log("Unwrapped wrapper: using req = rawArg.req");
   }
 
-  // validate env
   try {
     checkEnv();
   } catch (err) {
@@ -243,7 +229,6 @@ async function runHandler(rawArg, rawRes) {
     return out;
   }
 
-  // parse input
   let input = {};
   try {
     if (req && req.bodyJson && typeof req.bodyJson === "object") {
@@ -285,21 +270,48 @@ async function runHandler(rawArg, rawRes) {
     console.log("FINAL input preview:", JSON.stringify(input).slice(0, 200));
   } catch (e) { console.log("FINAL input (non-serializable)"); }
 
+  // ----- UPDATED response handling: explicitly send JSON via res when available -----
   try {
     const result = await handleAction(input);
+
+    // If Appwrite's modern runtime supplies a res.json, use it.
+    if (res && typeof res.json === "function") {
+      const status = result && result.ok === false ? 400 : 200;
+      // res.json(body, status) is accepted by Appwrite runtime; if not, fall through to next checks.
+      try {
+        return res.json(result, status);
+      } catch (e) {
+        // continue to other forms
+        console.warn("res.json failed, falling back:", e);
+      }
+    }
+
+    // Older runtime: res.status().json()
     if (res && typeof res.status === "function") {
       if (result && result.ok === false) return res.status(400).json(result);
       return res.status(200).json(result);
     }
+
+    // Fallback: console log (for local debug)
     console.log(JSON.stringify(result));
     return result;
   } catch (err) {
     console.error("ACTION ERROR:", err);
     const out = { ok: false, error: err.message || String(err) };
+
+    if (res && typeof res.json === "function") {
+      try {
+        return res.json(out, 500);
+      } catch (e) {
+        console.warn("res.json error in catch:", e);
+      }
+    }
     if (res && typeof res.status === "function") return res.status(500).json(out);
+
     console.log(JSON.stringify(out));
     return out;
   }
+  // ----- end updated response handling -----
 }
 
 /* Export & local debug */
