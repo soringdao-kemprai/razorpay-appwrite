@@ -1,18 +1,21 @@
 /**
- * Appwrite Function: razorpay-appwrite
+ * index.js - Appwrite Function (Node 18)
  *
- * Expects JSON string via functions.createExecution(functionId, JSON.stringify(payload))
- * payload = { action: "createOrder" | "verifyPayment", payload: {...} }
+ * Exports an HTTP handler for Appwrite to call.
+ * Also supports running via APPWRITE_FUNCTION_DATA (legacy).
  *
- * createOrder payload: { items: [{ productId, quantity }], userId, shippingAddress: { text, phone } }
- * verifyPayment payload: { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature }
+ * Required environment variables in Function settings:
+ * - RAZORPAY_KEY_ID
+ * - RAZORPAY_KEY_SECRET
+ * - APPWRITE_ENDPOINT
+ * - APPWRITE_PROJECT
+ * - APPWRITE_API_KEY
+ * - APPWRITE_DATABASE_ID
+ * - APPWRITE_ORDERS_COLLECTION_ID
  *
- * Responses: { ok: true, ... } or { ok: false, error: "message" }
- *
- * IMPORTANT: Set environment variables in Appwrite Function settings:
- * - RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET (server-only)
- * - APPWRITE_ENDPOINT, APPWRITE_PROJECT, APPWRITE_API_KEY
- * - APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID
+ * Usage:
+ * - Appwrite will call this as an HTTP handler.
+ * - Or you can run locally with APPWRITE_FUNCTION_DATA set to a JSON string.
  */
 
 const { Client, Databases, ID } = require("node-appwrite");
@@ -21,7 +24,6 @@ const crypto = require("crypto");
 
 const env = process.env;
 
-// Validate required env vars
 function checkEnv() {
   const required = [
     "RAZORPAY_KEY_ID",
@@ -33,49 +35,37 @@ function checkEnv() {
     "APPWRITE_ORDERS_COLLECTION_ID",
   ];
   const missing = required.filter((k) => !env[k]);
-  if (missing.length) {
-    throw new Error("Missing environment variables: " + missing.join(", "));
-  }
+  if (missing.length) throw new Error("Missing environment variables: " + missing.join(", "));
 }
 
 function jsonSafeParse(s) {
   try { return typeof s === "string" ? JSON.parse(s) : s; } catch { return s; }
 }
 
-// Build Appwrite client (server-side with API key)
-function getAppwriteClient() {
+function getAppwrite() {
   const client = new Client();
   client
     .setEndpoint(env.APPWRITE_ENDPOINT)
     .setProject(env.APPWRITE_PROJECT)
     .setKey(env.APPWRITE_API_KEY);
-  return {
-    client,
-    databases: new Databases(client)
-  };
+  return { client, databases: new Databases(client) };
 }
 
-// Utility to compute HMAC SHA256
 function generateSignature(orderId, paymentId, secret) {
   const hmac = crypto.createHmac("sha256", secret);
   hmac.update(`${orderId}|${paymentId}`);
   return hmac.digest("hex");
 }
 
-// Calculate amount to send to Razorpay (paise)
 function toPaise(amountNumber) {
-  // amountNumber expected in rupees (float or integer). Convert to paise integer.
   return Math.round(Number(amountNumber) * 100);
 }
 
-async function createOrderAction(input) {
-  const { items = [], userId, shippingAddress = {}, currency = "INR", receiptPrefix = "rcpt_" } = input;
-
-  // Basic server-side total calculation (you can modify to compute from product prices)
-  // Expectation: frontend sent subtotal/total? If not, compute a fallback approx.
-  // For production: recompute prices from product catalog on server to prevent manipulation.
-  const subtotal = Number(input.subtotal ?? 0);
-  const total = Number(input.totalAmount ?? subtotal);
+/* Action implementations */
+async function createOrderAction(payload) {
+  const { items = [], userId, shippingAddress = {}, currency = "INR", receiptPrefix = "rcpt_" } = payload;
+  const subtotal = Number(payload.subtotal ?? 0);
+  const total = Number(payload.totalAmount ?? subtotal);
 
   if (!userId) return { ok: false, error: "userId required" };
 
@@ -86,24 +76,14 @@ async function createOrderAction(input) {
 
   const amountPaise = toPaise(total || subtotal || 0);
 
-  // Create Razorpay order
-  const orderOptions = {
-    amount: amountPaise, // in paise
-    currency: currency,
-    receipt: `${receiptPrefix}${Date.now()}`,
-    partial_payment: false
-  };
+  const orderOptions = { amount: amountPaise, currency, receipt: `${receiptPrefix}${Date.now()}`, partial_payment: false };
 
   let rOrder;
-  try {
-    rOrder = await razorpay.orders.create(orderOptions);
-  } catch (err) {
-    return { ok: false, error: "Razorpay order creation failed: " + (err.message || err) };
-  }
+  try { rOrder = await razorpay.orders.create(orderOptions); }
+  catch (err) { return { ok: false, error: "Razorpay order creation failed: " + (err.message || err) }; }
 
-  // Save Appwrite order document
   try {
-    const { databases } = getAppwriteClient();
+    const { databases } = getAppwrite();
     const createPayload = {
       userId,
       items: JSON.stringify(items),
@@ -127,41 +107,24 @@ async function createOrderAction(input) {
       createPayload
     );
 
-    return {
-      ok: true,
-      orderId: doc.$id,
-      razorpayOrderId: rOrder.id,
-      amount: amountPaise,
-      currency,
-      razorpayKeyId: env.RAZORPAY_KEY_ID
-    };
+    return { ok: true, orderId: doc.$id, razorpayOrderId: rOrder.id, amount: amountPaise, currency, razorpayKeyId: env.RAZORPAY_KEY_ID };
   } catch (err) {
     return { ok: false, error: "Appwrite save order failed: " + (err.message || err) };
   }
 }
 
-async function verifyPaymentAction(input) {
-  const { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature } = input;
+async function verifyPaymentAction(payload) {
+  const { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature } = payload;
   if (!orderId || !razorpayPaymentId || !razorpayOrderId || !razorpaySignature) {
     return { ok: false, error: "Missing verification fields" };
   }
 
-  // Verify signature
   const expected = generateSignature(razorpayOrderId, razorpayPaymentId, env.RAZORPAY_KEY_SECRET);
-  if (expected !== razorpaySignature) {
-    return { ok: false, error: "Invalid signature" };
-  }
+  if (expected !== razorpaySignature) return { ok: false, error: "Invalid signature" };
 
-  // Update order in Appwrite to paid
   try {
-    const { databases } = getAppwriteClient();
+    const { databases } = getAppwrite();
 
-    // Find order doc by razorpayOrderId OR by custom orderId
-    // If you saved the appwrite doc id as orderId (recommended), use that. Here we try direct doc update by $id.
-    // If you use a different mapping, adjust lookup accordingly.
-    const docId = orderId;
-
-    // Update fields
     const updatePayload = {
       paymentStatus: "paid",
       paymentReference: razorpayPaymentId,
@@ -169,11 +132,10 @@ async function verifyPaymentAction(input) {
       razorpaySignature
     };
 
-    // Merge update (partial)
     const updated = await databases.updateDocument(
       env.APPWRITE_DATABASE_ID,
       env.APPWRITE_ORDERS_COLLECTION_ID,
-      docId,
+      orderId,
       updatePayload
     );
 
@@ -183,67 +145,66 @@ async function verifyPaymentAction(input) {
   }
 }
 
-// Entrypoint for Appwrite execution
-(async function main() {
+/* Main executor: determines action and runs it */
+async function handleAction(body) {
+  // body may be: { action, payload } or payload directly
+  const actionName = (body && (body.action || body?.payload?.action)) || (body?.payload?.action) || null;
+  const payload = (body && body.payload) || body || {};
+  const act = (body.action || payload.action || (payload.razorpayPaymentId ? "verifyPayment" : "createOrder") || "createOrder").toString().toLowerCase();
+
+  if (act === "createorder" || act === "createorder") return await createOrderAction(payload);
+  if (act === "verifypayment" || act === "verifypayment") return await verifyPaymentAction(payload);
+
+  // catch-all: guess based on fields
+  if (payload.razorpayPaymentId) return await verifyPaymentAction(payload);
+  return await createOrderAction(payload);
+}
+
+/* Exported HTTP handler Appwrite will call */
+module.exports = async function (req, res) {
   try {
     checkEnv();
-    const inputRaw = process.env.APPWRITE_FUNCTION_DATA || "";
-    if (!inputRaw) {
-      console.log("No input provided via APPWRITE_FUNCTION_DATA. Exiting.");
-      console.log(JSON.stringify({ ok: false, error: "No input" }));
-      return;
-    }
-    const body = jsonSafeParse(inputRaw);
-
-    const action = (body.action || body?.payload?.action || body?.actionName) || (body.action && body.action);
-    // Support different shapes: { action, payload } or { action: 'createOrder', payload: {...} } or payload passed directly
-    const payload = body.payload || body.data || body;
-
-    if (!action && payload && payload.action) {
-      // allow payload.action
-    }
-
-    // newer structure: { action: 'createOrder', payload: {...} }
-    const actualAction = body.action || (payload && payload.action) || (body?.a) || null;
-    const effectiveAction = actualAction || (body?.type) || (body?.op) || (body?.action);
-
-    const actionFinal = (body.action && body.action.toString()) || (payload && payload.action && payload.action.toString()) || effectiveAction;
-
-    // If still missing, try body.actionName
-    const actionNormalized = actionFinal ? actionFinal.toString() : (payload && payload.op) || null;
-
-    // Determine which action to run
-    let act = null;
-    if (body.action) act = body.action;
-    else if (payload && payload.action) act = payload.action;
-    else if (payload && payload.orderId && payload.razorpayPaymentId) act = "verifyPayment";
-    else act = "createOrder";
-
-    const actionLower = act && act.toString().toLowerCase();
-
-    if (actionLower === "createorder") {
-      const resp = await createOrderAction(payload);
-      console.log(JSON.stringify(resp));
-      return;
-    } else if (actionLower === "verifypayment") {
-      const resp = await verifyPaymentAction(payload);
-      console.log(JSON.stringify(resp));
-      return;
-    } else {
-      // fallback guess
-      if (payload && payload.razorpayPaymentId) {
-        const resp = await verifyPaymentAction(payload);
-        console.log(JSON.stringify(resp));
-        return;
-      } else {
-        const resp = await createOrderAction(payload);
-        console.log(JSON.stringify(resp));
-        return;
-      }
-    }
   } catch (err) {
-    console.error("Function error:", err);
-    console.log(JSON.stringify({ ok: false, error: err.message || String(err) }));
+    console.error("ENV ERROR:", err.message || err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
     return;
   }
-})();
+
+  // Accept input from either HTTP request body (Appwrite) or old APPWRITE_FUNCTION_DATA
+  let input = {};
+  if (req && req.body && Object.keys(req.body).length > 0) {
+    input = req.body;
+  } else if (process.env.APPWRITE_FUNCTION_DATA) {
+    try { input = JSON.parse(process.env.APPWRITE_FUNCTION_DATA); } catch { input = process.env.APPWRITE_FUNCTION_DATA; }
+  }
+
+  try {
+    const result = await handleAction(input);
+    // If result is object, respond with JSON and 200/400
+    if (result && result.ok === false) {
+      res.status(400).json(result);
+    } else {
+      res.status(200).json(result);
+    }
+  } catch (err) {
+    console.error("ACTION ERROR:", err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+};
+
+/* Also allow running locally with APPWRITE_FUNCTION_DATA (node index.js won't be called by Appwrite),
+   but Appwrite won't call this path — it uses exported handler above. */
+if (require.main === module) {
+  // Running as standalone script (not exported). Useful for local debugging:
+  (async () => {
+    try {
+      checkEnv();
+      const raw = process.env.APPWRITE_FUNCTION_DATA || "{}";
+      const body = jsonSafeParse(raw);
+      const out = await handleAction(body);
+      console.log(JSON.stringify(out, null, 2));
+    } catch (e) {
+      console.error(e);
+    }
+  })();
+}
