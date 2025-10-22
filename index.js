@@ -1,21 +1,12 @@
-/**
- * index.js - Razorpay / Appwrite function (updated)
- *
- * Required env vars:
- * - RAZORPAY_KEY_ID
- * - RAZORPAY_KEY_SECRET
- * - APPWRITE_ENDPOINT
- * - APPWRITE_PROJECT
- * - APPWRITE_API_KEY
- * - APPWRITE_DATABASE_ID
- * - APPWRITE_ORDERS_COLLECTION_ID
- *
- * This version:
- * - Computes amount from items if totals are missing
- * - Filters fields to only allowed Appwrite collection columns
- * - Robust parsing of Appwrite wrapper shapes
- * - Clear canonical response
- */
+// index.js - Razorpay / Appwrite function (async-friendly, quick-response)
+// Required env vars:
+// - RAZORPAY_KEY_ID
+// - RAZORPAY_KEY_SECRET
+// - APPWRITE_ENDPOINT
+// - APPWRITE_PROJECT
+// - APPWRITE_API_KEY
+// - APPWRITE_DATABASE_ID
+// - APPWRITE_ORDERS_COLLECTION_ID
 
 const { Client, Databases, ID } = require("node-appwrite");
 const Razorpay = require("razorpay");
@@ -186,7 +177,6 @@ async function createOrderAction(payload) {
     razorpayOrderObj: JSON.stringify(rOrder),
     razorpayPaymentId: null,
     razorpaySignature: null,
-    // razorpayKeyId intentionally omitted if collection does not have column
   };
 
   // Filter docPayload to only allowed fields (prevents "Unknown attribute" errors)
@@ -195,29 +185,36 @@ async function createOrderAction(payload) {
     if (allowedFields.includes(k)) docPayload[k] = rawDocPayload[k];
   }
 
+  // NON-BLOCKING: create Appwrite document in background (fire-and-forget)
   try {
     const { databases } = getAppwrite();
-    console.log("Creating Appwrite document (filtered):", { ...docPayload, razorpayOrderObj: "[omitted]" });
-    const doc = await databases.createDocument(
+    console.log("Creating Appwrite document (non-blocking):", { ...docPayload, razorpayOrderObj: "[omitted]" });
+
+    // call but do NOT await — let it finish in the background
+    databases.createDocument(
       env.APPWRITE_DATABASE_ID,
       env.APPWRITE_ORDERS_COLLECTION_ID,
       ID.unique(),
       docPayload
-    );
-    console.log("Appwrite createDocument result:", { $id: doc.$id });
-
-    // Return canonical response for client
-    return {
-      ok: true,
-      orderId: doc.$id,
-      razorpayOrderId: rOrder.id,
-      amount: amountPaise,
-      currency,
-    };
+    ).then((doc) => {
+      console.log("Appwrite createDocument result (async):", { $id: doc.$id });
+    }).catch((err) => {
+      console.error("Appwrite createDocument async error:", err && err.message ? err.message : err);
+    });
   } catch (err) {
-    console.error("Appwrite createDocument error:", err && err.message ? err.message : err);
-    return { ok: false, error: "Appwrite save order failed: " + (err?.message || String(err)) };
+    // Log the non-fatal error, but do not block response
+    console.error("Failed to start async createDocument:", err && err.message ? err.message : err);
   }
+
+  // Return response immediately for frontend so app won't timeout
+  return {
+    ok: true,
+    // Because DB create is async, we cannot return its $id here. Use a temporary client-visible id if needed:
+    orderId: "temp_" + Date.now(),
+    razorpayOrderId: rOrder.id,
+    amount: amountPaise,
+    currency,
+  };
 }
 
 /* ---------- Action: verifyPayment ---------- */
@@ -251,7 +248,7 @@ async function verifyPaymentAction(payload) {
     console.log("Appwrite updateDocument success:", { $id: updated.$id });
     return { ok: true, orderId: updated.$id, razorpayPaymentId, message: "Payment verified" };
   } catch (err) {
-    console.error("Appwrite updateDocument error:", err);
+    console.error("Appwrite updateDocument error:", err && err.message ? err.message : err);
     return { ok: false, error: "Failed to update order: " + (err?.message || String(err)) };
   }
 }
