@@ -8,8 +8,8 @@
     "test": "node index.js"
   },
   "dependencies": {
-    "node-appwrite": "^10.0.0",
-    "razorpay": "^2.9.0"
+    "node-appwrite": "^20.2.1",
+    "razorpay": "^2.3.0"
   },
   "engines": {
     "node": "18.x"
