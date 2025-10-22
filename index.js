@@ -1,7 +1,7 @@
 /**
- * index.js - Razorpay / Appwrite function
+ * index.js - Razorpay / Appwrite function (updated)
  *
- * Required environment variables:
+ * Required env vars:
  * - RAZORPAY_KEY_ID
  * - RAZORPAY_KEY_SECRET
  * - APPWRITE_ENDPOINT
@@ -17,7 +17,7 @@ const crypto = require("crypto");
 
 const env = process.env;
 
-/* Utilities */
+/* ---------- Utilities ---------- */
 function checkEnv() {
   const required = [
     "RAZORPAY_KEY_ID",
@@ -52,6 +52,7 @@ function getAppwrite() {
 function toPaise(amount) {
   const n = Number(amount ?? 0);
   if (Number.isNaN(n)) return 0;
+  // If it's likely rupees (< 1e6), treat as rupees and convert
   if (n > 0 && n < 1e6 && Math.abs(n - Math.round(n)) < 1e-9) {
     return Math.round(n * 100);
   }
@@ -64,7 +65,26 @@ function generateSignature(orderId, paymentId, secret) {
   return h.digest("hex");
 }
 
-/* Action: createOrder */
+/* ---------- Allowed fields for Appwrite 'orders' collection ----------
+   Update this list if you later add new columns to the collection.
+---------------------------------------------------------------------*/
+const allowedFields = [
+  "userId",
+  "items",
+  "subtotal",
+  "totalAmount",
+  "currency",
+  "shippingAddress",
+  "paymentStatus",
+  "paymentProvider",
+  "paymentReference",
+  "razorpayOrderId",
+  "razorpayOrderObj",
+  "razorpayPaymentId",
+  "razorpaySignature",
+];
+
+/* ---------- Action: createOrder ---------- */
 async function createOrderAction(payload) {
   const { userId } = payload || {};
   if (!userId) return { ok: false, error: "userId required" };
@@ -75,6 +95,7 @@ async function createOrderAction(payload) {
   const subtotal = payload.subtotal ?? 0;
   const total = payload.totalAmount ?? subtotal;
 
+  // Razorpay instance
   const razorpay = new Razorpay({
     key_id: env.RAZORPAY_KEY_ID,
     key_secret: env.RAZORPAY_KEY_SECRET,
@@ -85,6 +106,7 @@ async function createOrderAction(payload) {
     return { ok: false, error: "Invalid amount" };
   }
 
+  // Create order on Razorpay
   let rOrder;
   try {
     const orderOptions = {
@@ -106,51 +128,59 @@ async function createOrderAction(payload) {
     return { ok: false, error: "Razorpay did not return an order id" };
   }
 
+  // Prepare doc payload (stringify items/shippingAddress if needed)
+  const rawDocPayload = {
+    userId,
+    items: typeof items === "string" ? items : JSON.stringify(items),
+    subtotal: Number(subtotal),
+    totalAmount: Number(total),
+    currency,
+    shippingAddress: typeof shippingAddress === "string" ? shippingAddress : JSON.stringify(shippingAddress),
+    paymentStatus: "created",
+    paymentProvider: "razorpay",
+    paymentReference: null,
+    razorpayOrderId: rOrder.id,
+    razorpayOrderObj: JSON.stringify(rOrder),
+    razorpayPaymentId: null,
+    razorpaySignature: null,
+    // NOTE: razorpayKeyId intentionally NOT included here because the collection doesn't have that column.
+    // If you add a column for this in Appwrite, you may add it to allowedFields and include it here.
+  };
+
+  // Filter docPayload to only allowed fields (prevents "Unknown attribute" errors)
+  const docPayload = {};
+  for (const k of Object.keys(rawDocPayload)) {
+    if (allowedFields.includes(k)) docPayload[k] = rawDocPayload[k];
+  }
+
   try {
     const { databases } = getAppwrite();
-    const docPayload = {
-      userId,
-      items: typeof items === "string" ? items : JSON.stringify(items),
-      subtotal: Number(subtotal),
-      totalAmount: Number(total),
-      currency,
-      shippingAddress: typeof shippingAddress === "string" ? shippingAddress : JSON.stringify(shippingAddress),
-      paymentStatus: "created",
-      paymentProvider: "razorpay",
-      paymentReference: null,
-      razorpayOrderId: rOrder.id,
-      razorpayOrderObj: JSON.stringify(rOrder),
-      razorpayPaymentId: null,
-      razorpaySignature: null,
-      razorpayKeyId: env.RAZORPAY_KEY_ID || null,
-    };
-
-    console.log("Creating Appwrite document with payload:", { ...docPayload, razorpayOrderObj: "[omitted]" });
-
+    console.log("Creating Appwrite document with payload (filtered):", { ...docPayload, razorpayOrderObj: "[omitted]" });
     const doc = await databases.createDocument(
       env.APPWRITE_DATABASE_ID,
       env.APPWRITE_ORDERS_COLLECTION_ID,
       ID.unique(),
       docPayload
     );
-
     console.log("Appwrite createDocument result:", { $id: doc.$id });
 
+    // Return canonical response for client
     return {
       ok: true,
       orderId: doc.$id,
       razorpayOrderId: rOrder.id,
       amount: amountPaise,
       currency,
-      razorpayKeyId: env.RAZORPAY_KEY_ID || null,
+      // razorpayKeyId omitted because not stored in collection
     };
   } catch (err) {
     console.error("Appwrite createDocument error:", err && err.message ? err.message : err);
+    // If it's unknown attribute related, respond clearly
     return { ok: false, error: "Appwrite save order failed: " + (err?.message || String(err)) };
   }
 }
 
-/* Action: verifyPayment */
+/* ---------- Action: verifyPayment ---------- */
 async function verifyPaymentAction(payload) {
   const { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature } = payload || {};
   if (!orderId || !razorpayPaymentId || !razorpayOrderId || !razorpaySignature) {
@@ -186,7 +216,7 @@ async function verifyPaymentAction(payload) {
   }
 }
 
-/* Determine action and route to appropriate handler */
+/* ---------- Router ---------- */
 async function handleAction(body) {
   const actionFromBody = (body && (body.action || (body.payload && body.payload.action))) || null;
   const payload = (body && body.payload) || body || {};
@@ -200,14 +230,14 @@ async function handleAction(body) {
       .toString()
       .toLowerCase();
 
-  if (act === "createorder" || act === "createorder") return await createOrderAction(payload);
+  if (act === "createorder") return await createOrderAction(payload);
   if (act === "verifypayment") return await verifyPaymentAction(payload);
 
   if (payload.razorpayPaymentId) return await verifyPaymentAction(payload);
   return await createOrderAction(payload);
 }
 
-/* Robust input parsing for various Appwrite shapes */
+/* ---------- Robust input parsing + response handling ---------- */
 async function runHandler(rawArg, rawRes) {
   console.log("=== runHandler start ===");
 
@@ -219,16 +249,16 @@ async function runHandler(rawArg, rawRes) {
     console.log("Unwrapped wrapper: using req = rawArg.req");
   }
 
-  try {
-    checkEnv();
-  } catch (err) {
-    console.error("ENV missing:", err.message || err);
+  // ensure env
+  try { checkEnv(); } catch (err) {
+    console.error("ENV missing:", err && err.message ? err.message : err);
     const out = { ok: false, error: "Missing env vars: " + (err.message || String(err)) };
     if (res && typeof res.status === "function") return res.status(500).json(out);
     console.log(JSON.stringify(out));
     return out;
   }
 
+  // parse many possible shapes Appwrite may provide
   let input = {};
   try {
     if (req && req.bodyJson && typeof req.bodyJson === "object") {
@@ -270,51 +300,35 @@ async function runHandler(rawArg, rawRes) {
     console.log("FINAL input preview:", JSON.stringify(input).slice(0, 200));
   } catch (e) { console.log("FINAL input (non-serializable)"); }
 
-  // ----- UPDATED response handling: explicitly send JSON via res when available -----
+  // explicit response handling
   try {
     const result = await handleAction(input);
 
-    // If Appwrite's modern runtime supplies a res.json, use it.
     if (res && typeof res.json === "function") {
       const status = result && result.ok === false ? 400 : 200;
-      // res.json(body, status) is accepted by Appwrite runtime; if not, fall through to next checks.
-      try {
-        return res.json(result, status);
-      } catch (e) {
-        // continue to other forms
-        console.warn("res.json failed, falling back:", e);
-      }
+      try { return res.json(result, status); } catch (e) { console.warn("res.json failed, falling back:", e); }
     }
 
-    // Older runtime: res.status().json()
     if (res && typeof res.status === "function") {
       if (result && result.ok === false) return res.status(400).json(result);
       return res.status(200).json(result);
     }
 
-    // Fallback: console log (for local debug)
     console.log(JSON.stringify(result));
     return result;
   } catch (err) {
     console.error("ACTION ERROR:", err);
     const out = { ok: false, error: err.message || String(err) };
-
     if (res && typeof res.json === "function") {
-      try {
-        return res.json(out, 500);
-      } catch (e) {
-        console.warn("res.json error in catch:", e);
-      }
+      try { return res.json(out, 500); } catch (e) { console.warn("res.json error in catch:", e); }
     }
     if (res && typeof res.status === "function") return res.status(500).json(out);
-
     console.log(JSON.stringify(out));
     return out;
   }
-  // ----- end updated response handling -----
 }
 
-/* Export & local debug */
+/* ---------- Export handler ---------- */
 module.exports = async function (req, res) {
   return runHandler(req, res);
 };
