@@ -1,14 +1,13 @@
 /**
  * Razorpay Appwrite Function - index.js
  *
- * Universal handler supporting:
- * - Appwrite HTTP (req, res)
- * - Appwrite single-arg runtime (raw body)
+ * Robust universal handler that handles Appwrite's various execution payload shapes:
+ * - wrapper object: { req: { body, bodyJson, bodyText, ... }, res: {} }
+ * - direct (req, res)
+ * - single-arg raw body
+ * - uses APPWRITE_FUNCTION_DATA fallback
  *
- * This version includes instrumented logging in runHandler to inspect the exact
- * payload shape Appwrite passes to the function during Executions.
- *
- * Required environment variables (Function settings):
+ * Required env vars (set in Function settings):
  * - RAZORPAY_KEY_ID
  * - RAZORPAY_KEY_SECRET
  * - APPWRITE_ENDPOINT
@@ -16,12 +15,6 @@
  * - APPWRITE_API_KEY
  * - APPWRITE_DATABASE_ID
  * - APPWRITE_ORDERS_COLLECTION_ID
- *
- * Usage example (Execute / createExecution payload):
- * {
- *   "action":"createOrder",
- *   "payload": { "userId":"test", "items":[{"productId":"p1","quantity":1}], "subtotal":199, "totalAmount":199 }
- * }
  */
 
 const { Client, Databases, ID } = require("node-appwrite");
@@ -50,6 +43,21 @@ function checkEnv() {
 
 function jsonSafeParse(s) {
   try { return typeof s === "string" ? JSON.parse(s) : s; } catch { return s; }
+}
+
+function tryParseJSON(str) {
+  if (typeof str !== "string") return null;
+  try { return JSON.parse(str); } catch { return null; }
+}
+
+function bufferToString(bufObj) {
+  // bufObj is likely { type: 'Buffer', data: [..] }
+  try {
+    if (!bufObj || !Array.isArray(bufObj.data)) return null;
+    return Buffer.from(bufObj.data).toString("utf8");
+  } catch (e) {
+    return null;
+  }
 }
 
 function getAppwrite() {
@@ -105,7 +113,6 @@ async function createOrderAction(payload) {
     return { ok: false, error: "Razorpay order creation failed: " + (err?.message || String(err)) };
   }
 
-  // Save to Appwrite DB
   try {
     const { databases } = getAppwrite();
     const createPayload = {
@@ -191,43 +198,38 @@ async function handleAction(body) {
 
   const act = (actionFromBody || payload.action || (payload.razorpayPaymentId ? "verifyPayment" : "createOrder") || "createOrder").toString().toLowerCase();
 
-  if (act === "createorder" || act === "createorder") return await createOrderAction(payload);
-  if (act === "verifypayment" || act === "verifypayment") return await verifyPaymentAction(payload);
+  if (act === "createorder") return await createOrderAction(payload);
+  if (act === "verifypayment") return await verifyPaymentAction(payload);
 
   if (payload.razorpayPaymentId) return await verifyPaymentAction(payload);
   return await createOrderAction(payload);
 }
 
 /* -------------------------
-   Instrumented runHandler — replace previous runHandler
+   Robust input parsing + universal handler
    ------------------------- */
 
-async function runHandler(reqArg, resArg) {
-  // Log raw incoming argument types (helps debug how Appwrite passes data)
+async function runHandler(rawArg, rawRes) {
+  // log entry briefly
   try {
-    console.log("=== ENTRY: runHandler ===");
-    console.log("raw reqArg type:", typeof reqArg);
-    // try to stringify safely
-    try { console.log("raw reqArg:", JSON.stringify(reqArg)); } catch (e) { console.log("raw reqArg (non-serializable):", reqArg); }
-    console.log("APPWRITE_FUNCTION_DATA present:", !!process.env.APPWRITE_FUNCTION_DATA);
-    if (process.env.APPWRITE_FUNCTION_DATA) {
-      try { console.log("APPWRITE_FUNCTION_DATA:", process.env.APPWRITE_FUNCTION_DATA); } catch (e) { console.log("APPWRITE_FUNCTION_DATA not stringifiable"); }
-    }
-  } catch (e) {
-    console.error("Error logging entry data:", e);
+    console.log("=== runHandler entry ===");
+  } catch (e) {}
+
+  let req = rawArg;
+  let res = rawRes;
+
+  // Unwrap Appwrite wrapper: sometimes Appwrite passes { req: {...}, res: {...} }
+  if (req && typeof req === "object" && req.req && typeof req.req === "object") {
+    // often rawArg looks like { req: { body: "...", bodyJson: {...}, ... }, res: {} }
+    req = req.req;
+    // res may be rawArg.res
+    res = rawArg.res || res;
   }
 
-  let req = reqArg;
-  let res = resArg;
+  // Edge: if Appwrite passed (req, res) typical, we keep as-is.
 
-  // If Appwrite passes a single object w/o headers/body, treat that as the body
-  if (!res && reqArg && typeof reqArg === "object" && !("headers" in reqArg) && !("body" in reqArg)) {
-    req = { body: reqArg };
-  }
-
-  try {
-    checkEnv();
-  } catch (err) {
+  // Validate env early
+  try { checkEnv(); } catch (err) {
     const out = { ok: false, error: "Missing environment variables: " + (err.message || String(err)) };
     if (res && typeof res.status === "function") return res.status(500).json(out);
     console.error("ENV ERROR:", err);
@@ -235,49 +237,71 @@ async function runHandler(reqArg, resArg) {
     return out;
   }
 
-  // Resolve input from possible sources (improved parsing)
+  // Try to resolve input payload from many possible shapes
   let input = {};
+
   try {
-    if (req && req.body && Object.keys(req.body).length > 0) {
+    // 1) If request already has parsed bodyJson (Appwrite sometimes provides this)
+    if (req && req.bodyJson && typeof req.bodyJson === "object") {
+      input = req.bodyJson;
+      console.log("input <- req.bodyJson");
+    }
+    // 2) If req.body is an object (already parsed)
+    else if (req && req.body && typeof req.body === "object") {
       input = req.body;
-      console.log("parsed input from req.body");
-    } else if (typeof req === "string") {
-      // Appwrite may pass raw JSON string as req
-      try {
-        input = JSON.parse(req);
-        console.log("parsed input from req string");
-      } catch (e) {
-        console.log("req is string but JSON.parse failed:", e);
-        input = {};
-      }
-    } else if (req && req.payload && req.payload.userId) {
-      // Sometimes Appwrite nests the payload directly
+      console.log("input <- req.body (object)");
+    }
+    // 3) If req.body is a string that contains JSON
+    else if (req && req.body && typeof req.body === "string") {
+      const parsed = tryParseJSON(req.body);
+      if (parsed) { input = parsed; console.log("input <- parsed req.body string"); }
+      else { console.log("req.body string exists but JSON.parse failed"); }
+    }
+    // 4) If req.bodyText exists (string)
+    else if (req && req.bodyText && typeof req.bodyText === "string") {
+      const p = tryParseJSON(req.bodyText);
+      if (p) { input = p; console.log("input <- parsed req.bodyText"); }
+      else { console.log("req.bodyText present but parse failed"); }
+    }
+    // 5) If req.bodyRaw exists and is string
+    else if (req && req.bodyRaw && typeof req.bodyRaw === "string") {
+      const p = tryParseJSON(req.bodyRaw);
+      if (p) { input = p; console.log("input <- parsed req.bodyRaw"); }
+    }
+    // 6) If req.bodyBinary provided (Buffer-like)
+    else if (req && req.bodyBinary && req.bodyBinary.data && Array.isArray(req.bodyBinary.data)) {
+      const s = bufferToString(req.bodyBinary);
+      const p = tryParseJSON(s);
+      if (p) { input = p; console.log("input <- parsed bodyBinary -> string"); }
+    }
+    // 7) If top-level rawArg was a string (very rare)
+    else if (typeof rawArg === "string") {
+      const p = tryParseJSON(rawArg);
+      if (p) { input = p; console.log("input <- parsed rawArg string"); }
+    }
+    // 8) If APPWRITE_FUNCTION_DATA provided
+    else if (process.env.APPWRITE_FUNCTION_DATA) {
+      const p = tryParseJSON(process.env.APPWRITE_FUNCTION_DATA);
+      input = p ? p : process.env.APPWRITE_FUNCTION_DATA;
+      console.log("input <- APPWRITE_FUNCTION_DATA fallback");
+    }
+    // 9) If none of the above, maybe req itself contains payload fields (rare)
+    else if (req && (req.action || req.payload || req.userId)) {
       input = req;
-      console.log("parsed input from req.payload");
-    } else if (process.env.APPWRITE_FUNCTION_DATA) {
-      try {
-        input = JSON.parse(process.env.APPWRITE_FUNCTION_DATA);
-        console.log("parsed input from APPWRITE_FUNCTION_DATA");
-      } catch {
-        input = process.env.APPWRITE_FUNCTION_DATA;
-        console.log("used raw APPWRITE_FUNCTION_DATA (not JSON)");
-      }
+      console.log("input <- req as fallback");
     } else {
-      input = req || {};
-      console.log("used fallback req as input");
+      input = {};
+      console.log("input <- empty fallback");
     }
   } catch (e) {
-    console.error("Failed to parse input:", e);
+    console.error("Error resolving input:", e);
     input = {};
   }
 
-  // Log final input object for inspection
-  try {
-    try { console.log("FINAL input object:", JSON.stringify(input)); } catch (e) { console.log("FINAL input (non-serializable):", input); }
-  } catch (e) {
-    console.error("Error logging final input:", e);
-  }
+  // Log final input for debugging (Appwrite captures stdout)
+  try { console.log("FINAL input:", JSON.stringify(input)); } catch (e) { console.log("FINAL input (non-serializable)"); }
 
+  // Execute requested action
   try {
     const result = await handleAction(input);
 
@@ -286,7 +310,7 @@ async function runHandler(reqArg, resArg) {
       return res.status(200).json(result);
     }
 
-    // No res -> log & return (Appwrite captures stdout)
+    // No res available — print result for Executions UI and return it
     console.log(JSON.stringify(result));
     return result;
   } catch (err) {
@@ -298,7 +322,7 @@ async function runHandler(reqArg, resArg) {
   }
 }
 
-/* Export for Appwrite */
+/* Export handler for Appwrite */
 module.exports = async function (req, res) {
   return runHandler(req, res);
 };
