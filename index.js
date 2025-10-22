@@ -5,6 +5,9 @@
  * - Appwrite HTTP (req, res)
  * - Appwrite single-arg runtime (raw body)
  *
+ * This version includes instrumented logging in runHandler to inspect the exact
+ * payload shape Appwrite passes to the function during Executions.
+ *
  * Required environment variables (Function settings):
  * - RAZORPAY_KEY_ID
  * - RAZORPAY_KEY_SECRET
@@ -196,10 +199,24 @@ async function handleAction(body) {
 }
 
 /* -------------------------
-   Universal handler (improved input parsing)
+   Instrumented runHandler — replace previous runHandler
    ------------------------- */
 
 async function runHandler(reqArg, resArg) {
+  // Log raw incoming argument types (helps debug how Appwrite passes data)
+  try {
+    console.log("=== ENTRY: runHandler ===");
+    console.log("raw reqArg type:", typeof reqArg);
+    // try to stringify safely
+    try { console.log("raw reqArg:", JSON.stringify(reqArg)); } catch (e) { console.log("raw reqArg (non-serializable):", reqArg); }
+    console.log("APPWRITE_FUNCTION_DATA present:", !!process.env.APPWRITE_FUNCTION_DATA);
+    if (process.env.APPWRITE_FUNCTION_DATA) {
+      try { console.log("APPWRITE_FUNCTION_DATA:", process.env.APPWRITE_FUNCTION_DATA); } catch (e) { console.log("APPWRITE_FUNCTION_DATA not stringifiable"); }
+    }
+  } catch (e) {
+    console.error("Error logging entry data:", e);
+  }
+
   let req = reqArg;
   let res = resArg;
 
@@ -223,24 +240,42 @@ async function runHandler(reqArg, resArg) {
   try {
     if (req && req.body && Object.keys(req.body).length > 0) {
       input = req.body;
+      console.log("parsed input from req.body");
     } else if (typeof req === "string") {
       // Appwrite may pass raw JSON string as req
-      input = JSON.parse(req);
+      try {
+        input = JSON.parse(req);
+        console.log("parsed input from req string");
+      } catch (e) {
+        console.log("req is string but JSON.parse failed:", e);
+        input = {};
+      }
     } else if (req && req.payload && req.payload.userId) {
       // Sometimes Appwrite nests the payload directly
       input = req;
+      console.log("parsed input from req.payload");
     } else if (process.env.APPWRITE_FUNCTION_DATA) {
       try {
         input = JSON.parse(process.env.APPWRITE_FUNCTION_DATA);
+        console.log("parsed input from APPWRITE_FUNCTION_DATA");
       } catch {
         input = process.env.APPWRITE_FUNCTION_DATA;
+        console.log("used raw APPWRITE_FUNCTION_DATA (not JSON)");
       }
     } else {
       input = req || {};
+      console.log("used fallback req as input");
     }
   } catch (e) {
     console.error("Failed to parse input:", e);
     input = {};
+  }
+
+  // Log final input object for inspection
+  try {
+    try { console.log("FINAL input object:", JSON.stringify(input)); } catch (e) { console.log("FINAL input (non-serializable):", input); }
+  } catch (e) {
+    console.error("Error logging final input:", e);
   }
 
   try {
