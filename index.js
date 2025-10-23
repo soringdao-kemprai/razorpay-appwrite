@@ -1,7 +1,8 @@
 // index.js - Appwrite Function: createOrder (sync) + verifyPayment (robust)
 // Requires env vars:
-// RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, APPWRITE_ENDPOINT, APPWRITE_PROJECT, APPWRITE_API_KEY,
-// APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID
+// RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET,
+// APPWRITE_ENDPOINT, APPWRITE_PROJECT, APPWRITE_API_KEY,
+// APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID, APPWRITE_PRODUCTS_COLLECTION_ID
 
 const { Client, Databases, ID, Query } = require("node-appwrite");
 const Razorpay = require("razorpay");
@@ -9,6 +10,9 @@ const crypto = require("crypto");
 
 const env = process.env;
 
+/* -------------------------------------------------------------------------- */
+/*                              ENV VALIDATION                                */
+/* -------------------------------------------------------------------------- */
 function checkEnv() {
   const required = [
     "RAZORPAY_KEY_ID",
@@ -18,11 +22,15 @@ function checkEnv() {
     "APPWRITE_API_KEY",
     "APPWRITE_DATABASE_ID",
     "APPWRITE_ORDERS_COLLECTION_ID",
+    "APPWRITE_PRODUCTS_COLLECTION_ID", // NEW
   ];
   const missing = required.filter((k) => !env[k]);
   if (missing.length) throw new Error("Missing env: " + missing.join(", "));
 }
 
+/* -------------------------------------------------------------------------- */
+/*                              UTIL FUNCTIONS                                */
+/* -------------------------------------------------------------------------- */
 function tryParseJSON(s) {
   if (typeof s !== "string") return null;
   try { return JSON.parse(s); } catch { return null; }
@@ -34,8 +42,7 @@ function bufferToString(obj) {
 }
 
 function getAppwrite() {
-  const client = new Client();
-  client
+  const client = new Client()
     .setEndpoint(env.APPWRITE_ENDPOINT)
     .setProject(env.APPWRITE_PROJECT)
     .setKey(env.APPWRITE_API_KEY);
@@ -58,24 +65,9 @@ function generateSignature(orderId, paymentId, secret) {
   return h.digest("hex");
 }
 
-const allowedFields = [
-  "userId","items","subtotal","totalAmount","currency","shippingAddress",
-  "paymentStatus","paymentProvider","paymentReference","razorpayOrderId",
-  "razorpayOrderObj","razorpayPaymentId","razorpaySignature",
-];
-
-function computeTotalFromItems(items) {
-  if (!items || !Array.isArray(items)) return 0;
-  let total = 0;
-  for (const it of items) {
-    const qty = Number(it.quantity ?? it.q ?? it.qty ?? 0) || 0;
-    const price = Number(it.price ?? it.unitPrice ?? 0) || 0;
-    total += qty * price;
-  }
-  return total;
-}
-
-/* ---------- createOrder (synchronous DB save) ---------- */
+/* -------------------------------------------------------------------------- */
+/*                          ORDER CREATION (UPDATED)                          */
+/* -------------------------------------------------------------------------- */
 async function createOrderAction(payload) {
   const { userId } = payload || {};
   if (!userId) return { ok: false, error: "userId required" };
@@ -83,48 +75,92 @@ async function createOrderAction(payload) {
   const items = payload.items ?? [];
   const shippingAddress = payload.shippingAddress ?? {};
   const currency = payload.currency ?? "INR";
-  const subtotalProvided = payload.subtotal;
-  const totalProvided = payload.totalAmount;
 
-  let totalToUse = null;
-  if (totalProvided != null && !Number.isNaN(Number(totalProvided))) totalToUse = Number(totalProvided);
-  else if (subtotalProvided != null && !Number.isNaN(Number(subtotalProvided))) totalToUse = Number(subtotalProvided);
-  else {
-    const computed = computeTotalFromItems(items);
-    totalToUse = computed || 0;
+  if (!Array.isArray(items) || items.length === 0)
+    return { ok: false, error: "items array required" };
+
+  // validate shape
+  for (const it of items) {
+    if (!it.productId)
+      return { ok: false, error: "each item must include productId" };
+    if (!it.quantity || Number(it.quantity) <= 0)
+      return { ok: false, error: "invalid quantity for item " + JSON.stringify(it) };
   }
 
-  if (!totalToUse || Number(totalToUse) <= 0) {
-    return { ok: false, error: "Invalid amount: pass subtotal/totalAmount or include item.price fields" };
+  const { databases } = getAppwrite();
+  const productsColl = env.APPWRITE_PRODUCTS_COLLECTION_ID;
+
+  let computedTotal = 0;
+  const enrichedItems = [];
+
+  for (const it of items) {
+    const pid = String(it.productId);
+    let productDoc = null;
+    try {
+      productDoc = await databases.getDocument(env.APPWRITE_DATABASE_ID, productsColl, pid);
+    } catch (err) {
+      console.error("Product fetch failed:", pid, err.message);
+      productDoc = null;
+    }
+
+    if (!productDoc)
+      return { ok: false, error: `Product not found: ${pid}` };
+
+    const unitPrice = Number(productDoc.price ?? productDoc.pricePerPiece ?? 0);
+    const qty = Number(it.quantity ?? 0);
+    const lineTotal = unitPrice * qty;
+    computedTotal += lineTotal;
+
+    enrichedItems.push({
+      productId: pid,
+      quantity: qty,
+      unitPrice,
+      lineTotal,
+      productSnapshot: {
+        $id: productDoc.$id,
+        productName: productDoc.productName ?? productDoc.name ?? null,
+        category: productDoc.category ?? null,
+      },
+    });
   }
 
-  const razorpay = new Razorpay({ key_id: env.RAZORPAY_KEY_ID, key_secret: env.RAZORPAY_KEY_SECRET });
+  const totalToUse = computedTotal;
+  if (!totalToUse || Number(totalToUse) <= 0)
+    return { ok: false, error: "Invalid total computed from products" };
+
+  const razorpay = new Razorpay({
+    key_id: env.RAZORPAY_KEY_ID,
+    key_secret: env.RAZORPAY_KEY_SECRET,
+  });
+
   const amountPaise = toPaise(totalToUse);
-  if (!amountPaise || amountPaise <= 0) return { ok: false, error: "Invalid amount after conversion to paise" };
+  if (!amountPaise || amountPaise <= 0)
+    return { ok: false, error: "Invalid amount after paise conversion" };
 
   let rOrder;
   try {
-    const opts = { amount: amountPaise, currency, receipt: `rcpt_${Date.now()}`, partial_payment: false };
-    console.log("Razorpay create order options:", opts);
+    const opts = {
+      amount: amountPaise,
+      currency,
+      receipt: `rcpt_${Date.now()}`,
+      partial_payment: false,
+    };
+    console.log("Creating Razorpay order:", opts);
     rOrder = await razorpay.orders.create(opts);
-    console.log("Razorpay order created:", rOrder && rOrder.id ? { id: rOrder.id, status: rOrder.status } : rOrder);
+    console.log("Razorpay order created:", rOrder.id);
   } catch (err) {
-    console.error("Razorpay order create error:", err && err.message ? err.message : err);
-    return { ok: false, error: "Razorpay order creation failed: " + (err?.message || String(err)) };
+    console.error("Razorpay order create error:", err.message);
+    return { ok: false, error: "Razorpay create failed: " + err.message };
   }
 
-  if (!rOrder || !rOrder.id) {
-    console.error("Razorpay order missing id:", rOrder);
-    return { ok: false, error: "Razorpay did not return an order id" };
-  }
-
+  // Prepare Appwrite document payload
   const rawDocPayload = {
     userId,
-    items: typeof items === "string" ? items : JSON.stringify(items),
-    subtotal: Number(subtotalProvided ?? totalToUse),
+    items: JSON.stringify(enrichedItems),
+    subtotal: Number(totalToUse),
     totalAmount: Number(totalToUse),
     currency,
-    shippingAddress: typeof shippingAddress === "string" ? shippingAddress : JSON.stringify(shippingAddress),
+    shippingAddress: JSON.stringify(shippingAddress),
     paymentStatus: "created",
     paymentProvider: "razorpay",
     paymentReference: null,
@@ -134,24 +170,14 @@ async function createOrderAction(payload) {
     razorpaySignature: null,
   };
 
-  const docPayload = {};
-  for (const k of Object.keys(rawDocPayload)) {
-    if (allowedFields.includes(k)) docPayload[k] = rawDocPayload[k];
-  }
-
   try {
-    const { databases } = getAppwrite();
-    console.log("Creating Appwrite document (sync):", { ...docPayload, razorpayOrderObj: "[omitted]" });
-
     const doc = await databases.createDocument(
       env.APPWRITE_DATABASE_ID,
       env.APPWRITE_ORDERS_COLLECTION_ID,
       ID.unique(),
-      docPayload
+      rawDocPayload
     );
-
-    console.log("Appwrite createDocument result:", { $id: doc.$id });
-
+    console.log("Appwrite order doc created:", doc.$id);
     return {
       ok: true,
       orderId: doc.$id,
@@ -160,49 +186,52 @@ async function createOrderAction(payload) {
       currency,
     };
   } catch (err) {
-    console.error("Appwrite createDocument error (sync):", err && err.message ? err.message : err);
+    console.error("Appwrite createDocument error:", err.message);
     return {
       ok: false,
-      error: "Appwrite save order failed: " + (err?.message || String(err)),
+      error: "Appwrite save failed: " + err.message,
       raw: { razorpayOrderId: rOrder.id, amount: amountPaise, currency },
     };
   }
 }
 
-/* ---------- verifyPayment (fallback lookup by razorpayOrderId) ---------- */
+/* -------------------------------------------------------------------------- */
+/*                             VERIFY PAYMENT                                 */
+/* -------------------------------------------------------------------------- */
 async function verifyPaymentAction(payload) {
-  const { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature } = payload || {};
+  const { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature } =
+    payload || {};
 
-  if (!razorpayPaymentId || !razorpayOrderId || !razorpaySignature) {
-    return { ok: false, error: "Missing verification fields (razorpayPaymentId, razorpayOrderId, razorpaySignature required)" };
-  }
+  if (!razorpayPaymentId || !razorpayOrderId || !razorpaySignature)
+    return {
+      ok: false,
+      error: "Missing razorpayPaymentId, razorpayOrderId or razorpaySignature",
+    };
 
-  const expected = generateSignature(razorpayOrderId, razorpayPaymentId, env.RAZORPAY_KEY_SECRET);
-  if (expected !== razorpaySignature) return { ok: false, error: "Invalid signature" };
+  const expected = generateSignature(
+    razorpayOrderId,
+    razorpayPaymentId,
+    env.RAZORPAY_KEY_SECRET
+  );
+  if (expected !== razorpaySignature)
+    return { ok: false, error: "Invalid signature" };
 
   try {
     const { databases } = getAppwrite();
     let docIdToUpdate = orderId ?? null;
 
+    // fallback: find by razorpayOrderId
     if (!docIdToUpdate) {
-      try {
-        const listRes = await databases.listDocuments(
-          env.APPWRITE_DATABASE_ID,
-          env.APPWRITE_ORDERS_COLLECTION_ID,
-          [ Query.equal("razorpayOrderId", razorpayOrderId) ]
-        );
-        if (listRes && Array.isArray(listRes.documents) && listRes.documents.length > 0) {
-          docIdToUpdate = listRes.documents[0].$id;
-          console.log("Found order document by razorpayOrderId:", docIdToUpdate);
-        } else {
-          console.warn("No Appwrite order doc found for razorpayOrderId:", razorpayOrderId);
-        }
-      } catch (listErr) {
-        console.error("Error listing documents by razorpayOrderId:", listErr);
-      }
+      const res = await databases.listDocuments(
+        env.APPWRITE_DATABASE_ID,
+        env.APPWRITE_ORDERS_COLLECTION_ID,
+        [Query.equal("razorpayOrderId", razorpayOrderId)]
+      );
+      if (res.documents?.length) docIdToUpdate = res.documents[0].$id;
     }
 
-    if (!docIdToUpdate) return { ok: false, error: "Order document not found for verification. Provide valid orderId or ensure DB contains razorpayOrderId." };
+    if (!docIdToUpdate)
+      return { ok: false, error: "Order not found for verification" };
 
     const update = {
       paymentStatus: "paid",
@@ -218,101 +247,85 @@ async function verifyPaymentAction(payload) {
       update
     );
 
-    console.log("Appwrite updateDocument success:", { $id: updated.$id });
-    return { ok: true, orderId: updated.$id, razorpayPaymentId, message: "Payment verified" };
+    console.log("Order verified:", updated.$id);
+    return { ok: true, orderId: updated.$id, message: "Payment verified" };
   } catch (err) {
-    console.error("Appwrite updateDocument error:", err && err.message ? err.message : err);
-    return { ok: false, error: "Failed to update order: " + (err?.message || String(err)) };
+    console.error("verifyPaymentAction error:", err.message);
+    return { ok: false, error: err.message };
   }
 }
 
-/* ---------- Router & input parsing ---------- */
+/* -------------------------------------------------------------------------- */
+/*                               MAIN HANDLER                                 */
+/* -------------------------------------------------------------------------- */
 async function handleAction(body) {
-  const actionFromBody = (body && (body.action || (body.payload && body.payload.action))) || null;
-  const payload = (body && body.payload) || body || {};
+  const action =
+    (body && (body.action || body.payload?.action))?.toString()?.toLowerCase?.() ??
+    null;
+  const payload = body?.payload || body || {};
 
-  const act = (actionFromBody || payload.action || (payload.razorpayPaymentId ? "verifyPayment" : "createOrder") || "createOrder").toString().toLowerCase();
-
-  if (act === "createorder") return await createOrderAction(payload);
-  if (act === "verifypayment") return await verifyPaymentAction(payload);
-  if (payload.razorpayPaymentId) return await verifyPaymentAction(payload);
+  if (action === "verifypayment") return await verifyPaymentAction(payload);
   return await createOrderAction(payload);
 }
 
+/* -------------------------------------------------------------------------- */
+/*                               ENTRY POINT                                  */
+/* -------------------------------------------------------------------------- */
 async function runHandler(rawArg, rawRes) {
-  console.log("=== runHandler start ===");
-
-  let req = rawArg;
-  let res = rawRes;
-  if (req && typeof req === "object" && req.req && typeof req.req === "object") {
-    req = req.req;
-    res = rawArg.res || res;
-    console.log("Unwrapped wrapper: using req = rawArg.req");
-  }
-
-  try { checkEnv(); } catch (err) {
-    console.error("ENV missing:", err && err.message ? err.message : err);
-    const out = { ok: false, error: "Missing env vars: " + (err.message || String(err)) };
-    if (res && typeof res.status === "function") return res.status(500).json(out);
+  console.log("=== Appwrite Function: Razorpay Handler Start ===");
+  try {
+    checkEnv();
+  } catch (err) {
+    console.error("ENV missing:", err.message);
+    const out = { ok: false, error: "Missing env vars: " + err.message };
+    if (rawRes?.json) return rawRes.json(out, 500);
     console.log(JSON.stringify(out));
     return out;
   }
 
+  // Parse input
   let input = {};
   try {
-    if (req && req.bodyJson && typeof req.bodyJson === "object") input = req.bodyJson;
-    else if (req && req.body && typeof req.body === "object") input = req.body;
-    else if (req && req.body && typeof req.body === "string") {
-      const p = tryParseJSON(req.body); if (p) input = p;
-    } else if (req && req.bodyBinary && req.bodyBinary.data) {
-      const s = bufferToString(req.bodyBinary); const p = tryParseJSON(s); if (p) input = p;
-    } else if (process.env.APPWRITE_FUNCTION_DATA) {
-      const p = tryParseJSON(process.env.APPWRITE_FUNCTION_DATA); input = p ? p : process.env.APPWRITE_FUNCTION_DATA;
-    } else if (typeof rawArg === "string") {
-      const p = tryParseJSON(rawArg); if (p) input = p;
-    } else input = req || {};
-  } catch (e) { console.error("Failed to parse input:", e); input = {}; }
+    if (rawArg?.bodyJson && typeof rawArg.bodyJson === "object")
+      input = rawArg.bodyJson;
+    else if (rawArg?.body && typeof rawArg.body === "object")
+      input = rawArg.body;
+    else if (typeof rawArg === "string") input = tryParseJSON(rawArg) || {};
+    else if (process.env.APPWRITE_FUNCTION_DATA)
+      input = tryParseJSON(process.env.APPWRITE_FUNCTION_DATA) || {};
+  } catch (e) {
+    console.error("Failed to parse input:", e);
+  }
 
-  try { console.log("FINAL input preview:", JSON.stringify(input).slice(0,200)); } catch (e) {}
+  console.log("Input preview:", JSON.stringify(input).slice(0, 300));
 
   try {
     const result = await handleAction(input);
-    if (res && typeof res.json === "function") {
-      const status = result && result.ok === false ? 400 : 200;
-      try { return res.json(result, status); } catch (e) { console.warn("res.json failed:", e); }
-    }
-    if (res && typeof res.status === "function") {
-      if (result && result.ok === false) return res.status(400).json(result);
-      return res.status(200).json(result);
+    if (rawRes?.json) {
+      const status = result?.ok === false ? 400 : 200;
+      return rawRes.json(result, status);
     }
     console.log(JSON.stringify(result));
     return result;
   } catch (err) {
-    console.error("ACTION ERROR:", err);
-    const out = { ok: false, error: err.message || String(err) };
-    if (res && typeof res.json === "function") {
-      try { return res.json(out, 500); } catch (e) { console.warn("res.json error in catch:", e); }
-    }
-    if (res && typeof res.status === "function") return res.status(500).json(out);
+    console.error("Handler error:", err);
+    const out = { ok: false, error: err.message };
+    if (rawRes?.json) return rawRes.json(out, 500);
     console.log(JSON.stringify(out));
     return out;
   }
 }
 
-/* Export */
 module.exports = async function (req, res) {
   return runHandler(req, res);
 };
 
+// Local testing
 if (require.main === module) {
   (async () => {
-    try {
-      const raw = process.env.APPWRITE_FUNCTION_DATA || "{}";
-      const body = tryParseJSON(raw) || {};
-      const out = await handleAction(body);
-      console.log(JSON.stringify(out, null, 2));
-    } catch (e) {
-      console.error(e);
-    }
+    const raw = process.env.APPWRITE_FUNCTION_DATA || "{}";
+    const body = tryParseJSON(raw) || {};
+    const out = await handleAction(body);
+    console.log(JSON.stringify(out, null, 2));
   })();
 }
