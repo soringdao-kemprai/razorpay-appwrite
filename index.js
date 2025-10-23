@@ -1,5 +1,5 @@
 // index.js - Appwrite Function: createOrder (sync) + verifyPayment (robust)
-// Requires env vars:
+// Required env vars (function-level):
 // RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET,
 // APPWRITE_ENDPOINT, APPWRITE_PROJECT, APPWRITE_API_KEY,
 // APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID, APPWRITE_PRODUCTS_COLLECTION_ID
@@ -15,7 +15,6 @@ const env = process.env;
 /* -------------------------------------------------------------------------- */
 function checkEnv() {
   const required = [
-    "APRWRITE_PRODUCT_ID",
     "RAZORPAY_KEY_ID",
     "RAZORPAY_KEY_SECRET",
     "APPWRITE_ENDPOINT",
@@ -23,7 +22,7 @@ function checkEnv() {
     "APPWRITE_API_KEY",
     "APPWRITE_DATABASE_ID",
     "APPWRITE_ORDERS_COLLECTION_ID",
-     // NEW
+    "APPWRITE_PRODUCTS_COLLECTION_ID",
   ];
   const missing = required.filter((k) => !env[k]);
   if (missing.length) throw new Error("Missing env: " + missing.join(", "));
@@ -100,7 +99,7 @@ async function createOrderAction(payload) {
     try {
       productDoc = await databases.getDocument(env.APPWRITE_DATABASE_ID, productsColl, pid);
     } catch (err) {
-      console.error("Product fetch failed:", pid, err.message);
+      console.error("Product fetch failed:", pid, err && err.message ? err.message : err);
       productDoc = null;
     }
 
@@ -148,10 +147,10 @@ async function createOrderAction(payload) {
     };
     console.log("Creating Razorpay order:", opts);
     rOrder = await razorpay.orders.create(opts);
-    console.log("Razorpay order created:", rOrder.id);
+    console.log("Razorpay order created:", rOrder && rOrder.id ? rOrder.id : JSON.stringify(rOrder));
   } catch (err) {
-    console.error("Razorpay order create error:", err.message);
-    return { ok: false, error: "Razorpay create failed: " + err.message };
+    console.error("Razorpay order create error:", err && err.message ? err.message : err);
+    return { ok: false, error: "Razorpay create failed: " + (err?.message || String(err)) };
   }
 
   // Prepare Appwrite document payload
@@ -161,7 +160,7 @@ async function createOrderAction(payload) {
     subtotal: Number(totalToUse),
     totalAmount: Number(totalToUse),
     currency,
-    shippingAddress: JSON.stringify(shippingAddress),
+    shippingAddress: typeof shippingAddress === "string" ? shippingAddress : JSON.stringify(shippingAddress),
     paymentStatus: "created",
     paymentProvider: "razorpay",
     paymentReference: null,
@@ -187,10 +186,10 @@ async function createOrderAction(payload) {
       currency,
     };
   } catch (err) {
-    console.error("Appwrite createDocument error:", err.message);
+    console.error("Appwrite createDocument error:", err && err.message ? err.message : err);
     return {
       ok: false,
-      error: "Appwrite save failed: " + err.message,
+      error: "Appwrite save failed: " + (err?.message || String(err)),
       raw: { razorpayOrderId: rOrder.id, amount: amountPaise, currency },
     };
   }
@@ -251,8 +250,8 @@ async function verifyPaymentAction(payload) {
     console.log("Order verified:", updated.$id);
     return { ok: true, orderId: updated.$id, message: "Payment verified" };
   } catch (err) {
-    console.error("verifyPaymentAction error:", err.message);
-    return { ok: false, error: err.message };
+    console.error("verifyPaymentAction error:", err && err.message ? err.message : err);
+    return { ok: false, error: err?.message ?? String(err) };
   }
 }
 
@@ -274,11 +273,19 @@ async function handleAction(body) {
 /* -------------------------------------------------------------------------- */
 async function runHandler(rawArg, rawRes) {
   console.log("=== Appwrite Function: Razorpay Handler Start ===");
+
+  // DEBUG helper (temporary): see which env keys are present
   try {
-    checkEnv();
-  } catch (err) {
-    console.error("ENV missing:", err.message);
-    const out = { ok: false, error: "Missing env vars: " + err.message };
+    const keys = Object.keys(process.env || {}).filter(k => /APPWRITE|RAZORPAY/i.test(k));
+    console.log("DEBUG: available env keys (filtered):", keys);
+    console.log("DEBUG: APPWRITE_PRODUCTS_COLLECTION_ID value:", process.env.APPWRITE_PRODUCTS_COLLECTION_ID);
+  } catch (e) {
+    console.warn("DEBUG env listing error:", e && e.message);
+  }
+
+  try { checkEnv(); } catch (err) {
+    console.error("ENV missing:", err && err.message ? err.message : err);
+    const out = { ok: false, error: "Missing env vars: " + (err && err.message ? err.message : String(err)) };
     if (rawRes?.json) return rawRes.json(out, 500);
     console.log(JSON.stringify(out));
     return out;
@@ -295,7 +302,7 @@ async function runHandler(rawArg, rawRes) {
     else if (process.env.APPWRITE_FUNCTION_DATA)
       input = tryParseJSON(process.env.APPWRITE_FUNCTION_DATA) || {};
   } catch (e) {
-    console.error("Failed to parse input:", e);
+    console.error("Failed to parse input:", e && e.message ? e.message : e);
   }
 
   console.log("Input preview:", JSON.stringify(input).slice(0, 300));
@@ -309,8 +316,8 @@ async function runHandler(rawArg, rawRes) {
     console.log(JSON.stringify(result));
     return result;
   } catch (err) {
-    console.error("Handler error:", err);
-    const out = { ok: false, error: err.message };
+    console.error("Handler error:", err && err.message ? err.message : err);
+    const out = { ok: false, error: err && err.message ? err.message : String(err) };
     if (rawRes?.json) return rawRes.json(out, 500);
     console.log(JSON.stringify(out));
     return out;
@@ -321,7 +328,7 @@ module.exports = async function (req, res) {
   return runHandler(req, res);
 };
 
-// Local testing
+// Local testing support
 if (require.main === module) {
   (async () => {
     const raw = process.env.APPWRITE_FUNCTION_DATA || "{}";
