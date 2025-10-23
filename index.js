@@ -22,7 +22,7 @@ function checkEnv() {
     "APPWRITE_API_KEY",
     "APPWRITE_DATABASE_ID",
     "APPWRITE_ORDERS_COLLECTION_ID",
-    "APPWRITE_PRODUCTS_COLLECTION_ID", // NEW
+    "APRWRITE_PRODUCT_ID", // NEW
   ];
   const missing = required.filter((k) => !env[k]);
   if (missing.length) throw new Error("Missing env: " + missing.join(", "));
