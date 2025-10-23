@@ -1,5 +1,5 @@
-// index.js - Appwrite Function: createOrder (sync) + verifyPayment (robust)
-// Required env vars (function-level):
+// index.js - Appwrite Function: createOrder (Razorpay) + verifyPayment
+// Requires env vars:
 // RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET,
 // APPWRITE_ENDPOINT, APPWRITE_PROJECT, APPWRITE_API_KEY,
 // APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID, APPWRITE_PRODUCTS_COLLECTION_ID
@@ -36,11 +36,6 @@ function tryParseJSON(s) {
   try { return JSON.parse(s); } catch { return null; }
 }
 
-function bufferToString(obj) {
-  if (!obj || !Array.isArray(obj.data)) return null;
-  try { return Buffer.from(obj.data).toString("utf8"); } catch { return null; }
-}
-
 function getAppwrite() {
   const client = new Client()
     .setEndpoint(env.APPWRITE_ENDPOINT)
@@ -66,7 +61,7 @@ function generateSignature(orderId, paymentId, secret) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                          ORDER CREATION (UPDATED)                          */
+/*                             CREATE ORDER ACTION                            */
 /* -------------------------------------------------------------------------- */
 async function createOrderAction(payload) {
   const { userId } = payload || {};
@@ -79,7 +74,6 @@ async function createOrderAction(payload) {
   if (!Array.isArray(items) || items.length === 0)
     return { ok: false, error: "items array required" };
 
-  // validate shape
   for (const it of items) {
     if (!it.productId)
       return { ok: false, error: "each item must include productId" };
@@ -99,7 +93,7 @@ async function createOrderAction(payload) {
     try {
       productDoc = await databases.getDocument(env.APPWRITE_DATABASE_ID, productsColl, pid);
     } catch (err) {
-      console.error("Product fetch failed:", pid, err && err.message ? err.message : err);
+      console.error("Product fetch failed:", pid, err.message);
       productDoc = null;
     }
 
@@ -128,6 +122,7 @@ async function createOrderAction(payload) {
   if (!totalToUse || Number(totalToUse) <= 0)
     return { ok: false, error: "Invalid total computed from products" };
 
+  // Create Razorpay order
   const razorpay = new Razorpay({
     key_id: env.RAZORPAY_KEY_ID,
     key_secret: env.RAZORPAY_KEY_SECRET,
@@ -147,20 +142,20 @@ async function createOrderAction(payload) {
     };
     console.log("Creating Razorpay order:", opts);
     rOrder = await razorpay.orders.create(opts);
-    console.log("Razorpay order created:", rOrder && rOrder.id ? rOrder.id : JSON.stringify(rOrder));
+    console.log("Razorpay order created:", rOrder.id);
   } catch (err) {
-    console.error("Razorpay order create error:", err && err.message ? err.message : err);
-    return { ok: false, error: "Razorpay create failed: " + (err?.message || String(err)) };
+    console.error("Razorpay order create error:", err.message);
+    return { ok: false, error: "Razorpay create failed: " + err.message };
   }
 
-  // Prepare Appwrite document payload
+  // Save order to Appwrite
   const rawDocPayload = {
     userId,
     items: JSON.stringify(enrichedItems),
     subtotal: Number(totalToUse),
     totalAmount: Number(totalToUse),
     currency,
-    shippingAddress: typeof shippingAddress === "string" ? shippingAddress : JSON.stringify(shippingAddress),
+    shippingAddress: JSON.stringify(shippingAddress),
     paymentStatus: "created",
     paymentProvider: "razorpay",
     paymentReference: null,
@@ -186,27 +181,24 @@ async function createOrderAction(payload) {
       currency,
     };
   } catch (err) {
-    console.error("Appwrite createDocument error:", err && err.message ? err.message : err);
+    console.error("Appwrite createDocument error:", err.message);
     return {
       ok: false,
-      error: "Appwrite save failed: " + (err?.message || String(err)),
+      error: "Appwrite save failed: " + err.message,
       raw: { razorpayOrderId: rOrder.id, amount: amountPaise, currency },
     };
   }
 }
 
 /* -------------------------------------------------------------------------- */
-/*                             VERIFY PAYMENT                                 */
+/*                           VERIFY PAYMENT ACTION                            */
 /* -------------------------------------------------------------------------- */
 async function verifyPaymentAction(payload) {
   const { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature } =
     payload || {};
 
   if (!razorpayPaymentId || !razorpayOrderId || !razorpaySignature)
-    return {
-      ok: false,
-      error: "Missing razorpayPaymentId, razorpayOrderId or razorpaySignature",
-    };
+    return { ok: false, error: "Missing razorpayPaymentId, razorpayOrderId or razorpaySignature" };
 
   const expected = generateSignature(
     razorpayOrderId,
@@ -220,7 +212,6 @@ async function verifyPaymentAction(payload) {
     const { databases } = getAppwrite();
     let docIdToUpdate = orderId ?? null;
 
-    // fallback: find by razorpayOrderId
     if (!docIdToUpdate) {
       const res = await databases.listDocuments(
         env.APPWRITE_DATABASE_ID,
@@ -250,18 +241,17 @@ async function verifyPaymentAction(payload) {
     console.log("Order verified:", updated.$id);
     return { ok: true, orderId: updated.$id, message: "Payment verified" };
   } catch (err) {
-    console.error("verifyPaymentAction error:", err && err.message ? err.message : err);
-    return { ok: false, error: err?.message ?? String(err) };
+    console.error("verifyPaymentAction error:", err.message);
+    return { ok: false, error: err.message };
   }
 }
 
 /* -------------------------------------------------------------------------- */
-/*                               MAIN HANDLER                                 */
+/*                             MAIN ACTION ROUTER                             */
 /* -------------------------------------------------------------------------- */
 async function handleAction(body) {
   const action =
-    (body && (body.action || body.payload?.action))?.toString()?.toLowerCase?.() ??
-    null;
+    (body && (body.action || body.payload?.action))?.toString()?.toLowerCase?.() ?? null;
   const payload = body?.payload || body || {};
 
   if (action === "verifypayment") return await verifyPaymentAction(payload);
@@ -269,55 +259,55 @@ async function handleAction(body) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                               ENTRY POINT                                  */
+/*                                 ENTRY POINT                                */
 /* -------------------------------------------------------------------------- */
 async function runHandler(rawArg, rawRes) {
   console.log("=== Appwrite Function: Razorpay Handler Start ===");
 
-  // DEBUG helper (temporary): see which env keys are present
-  try {
-    const keys = Object.keys(process.env || {}).filter(k => /APPWRITE|RAZORPAY/i.test(k));
-    console.log("DEBUG: available env keys (filtered):", keys);
-    console.log("DEBUG: APPWRITE_PRODUCTS_COLLECTION_ID value:", process.env.APPWRITE_PRODUCTS_COLLECTION_ID);
-  } catch (e) {
-    console.warn("DEBUG env listing error:", e && e.message);
-  }
-
-  try { checkEnv(); } catch (err) {
-    console.error("ENV missing:", err && err.message ? err.message : err);
-    const out = { ok: false, error: "Missing env vars: " + (err && err.message ? err.message : String(err)) };
+  try { checkEnv(); }
+  catch (err) {
+    console.error("ENV missing:", err.message);
+    const out = { ok: false, error: "Missing env vars: " + err.message };
     if (rawRes?.json) return rawRes.json(out, 500);
     console.log(JSON.stringify(out));
     return out;
   }
 
-  // Parse input
   let input = {};
   try {
     if (rawArg?.bodyJson && typeof rawArg.bodyJson === "object")
       input = rawArg.bodyJson;
     else if (rawArg?.body && typeof rawArg.body === "object")
       input = rawArg.body;
-    else if (typeof rawArg === "string") input = tryParseJSON(rawArg) || {};
+    else if (typeof rawArg === "string")
+      input = tryParseJSON(rawArg) || {};
     else if (process.env.APPWRITE_FUNCTION_DATA)
       input = tryParseJSON(process.env.APPWRITE_FUNCTION_DATA) || {};
   } catch (e) {
-    console.error("Failed to parse input:", e && e.message ? e.message : e);
+    console.error("Failed to parse input:", e.message);
   }
 
   console.log("Input preview:", JSON.stringify(input).slice(0, 300));
 
   try {
     const result = await handleAction(input);
+
+    // 👇 NEW FIX: log result to stdout so Appwrite SDK returns it in exec.stdout
+    try {
+      console.log("FUNCTION_RESULT:", JSON.stringify(result));
+    } catch {
+      console.log("FUNCTION_RESULT_FALLBACK", result);
+    }
+
     if (rawRes?.json) {
       const status = result?.ok === false ? 400 : 200;
       return rawRes.json(result, status);
     }
-    console.log(JSON.stringify(result));
+
     return result;
   } catch (err) {
-    console.error("Handler error:", err && err.message ? err.message : err);
-    const out = { ok: false, error: err && err.message ? err.message : String(err) };
+    console.error("Handler error:", err.message);
+    const out = { ok: false, error: err.message };
     if (rawRes?.json) return rawRes.json(out, 500);
     console.log(JSON.stringify(out));
     return out;
