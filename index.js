@@ -1,4 +1,4 @@
-// index.js - Appwrite Function: createOrder (sync) + verifyPayment (robust)
+// index.js - Appwrite Function: createOrder (sync) + verifyPayment
 //
 // Required env vars (function-level):
 // RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET,
@@ -54,7 +54,7 @@ function getAppwrite() {
 function toPaise(amount) {
   const n = Number(amount ?? 0);
   if (Number.isNaN(n)) return 0;
-  // if already in rupees, convert
+  // If amount looks like rupees (not huge integer), convert to paise
   if (n > 0 && n < 1e6 && Math.abs(n - Math.round(n)) < 1e-9) {
     return Math.round(n * 100);
   }
@@ -70,46 +70,27 @@ function generateSignature(orderId, paymentId, secret) {
 /* -------------------------------------------------------------------------- */
 /*                 Robust input parsing (Appwrite wrapper aware)              */
 /* -------------------------------------------------------------------------- */
-/**
- * Accepts many shapes:
- * - direct body: { action, payload }
- * - rawArg as stringified JSON
- * - Appwrite wrapper: rawArg.req.body (string)
- * - process.env.APPWRITE_FUNCTION_DATA
- */
 function extractInput(rawArg) {
-  // rawArg provided by Appwrite
   try {
-    // 1) rawArg.bodyJson (Appwrite sometimes populates)
     if (rawArg?.bodyJson && typeof rawArg.bodyJson === "object") return rawArg.bodyJson;
-
-    // 2) rawArg.body if object
     if (rawArg?.body && typeof rawArg.body === "object") return rawArg.body;
-
-    // 3) rawArg.body if string
     if (rawArg?.body && typeof rawArg.body === "string") {
       const parsed = tryParseJSON(rawArg.body);
       if (parsed) return parsed;
     }
-
-    // 4) Appwrite wrapper: rawArg.req?.body is a JSON string (observed in your logs)
     if (rawArg?.req && typeof rawArg.req === "object") {
       const rb = rawArg.req.body;
       if (typeof rb === "string") {
         const parsed = tryParseJSON(rb);
         if (parsed) return parsed;
-      } else if (typeof rawArg.req.body === "object" && rawArg.req.body) {
-        return rawArg.req.body;
+      } else if (typeof rb === "object" && rb) {
+        return rb;
       }
     }
-
-    // 5) rawArg as string
     if (typeof rawArg === "string") {
       const parsed = tryParseJSON(rawArg);
       if (parsed) return parsed;
     }
-
-    // 6) function data
     if (process.env.APPWRITE_FUNCTION_DATA) {
       const parsed = tryParseJSON(process.env.APPWRITE_FUNCTION_DATA);
       if (parsed) return parsed;
@@ -125,9 +106,8 @@ function extractInput(rawArg) {
 /*                          ORDER CREATION (UPDATED)                          */
 /* -------------------------------------------------------------------------- */
 async function createOrderAction(payload) {
-  // payload may be nested (payload.payload). Normalize:
+  // payload might be nested, handle common shapes
   const p = payload?.payload ?? payload ?? {};
-  // Allow both top-level userId or payload.userId
   const userId = p.userId ?? p.user_id ?? null;
   if (!userId) return { ok: false, error: "userId required" };
 
@@ -135,57 +115,36 @@ async function createOrderAction(payload) {
   const shippingAddress = p.shippingAddress ?? p.shipping_address ?? p.shipping ?? {};
   const currency = p.currency ?? "INR";
 
-  // Accept many item shapes:
-  // - array of objects [{ productId, quantity }]
-  // - array of strings ["<productId>"]
-  // - array of objects only with quantity (client may have items with id in other fields)
-  // Normalize to { productId, quantity }
+  // normalize items array (accept stringified array or various shapes)
   if (!Array.isArray(items)) {
-    // maybe stringified JSON
     if (typeof items === "string") {
       const parsed = tryParseJSON(items);
-      if (Array.isArray(parsed)) items = parsed;
-      else items = [];
-    } else {
-      items = [];
-    }
+      items = Array.isArray(parsed) ? parsed : [];
+    } else items = [];
   }
-
   if (items.length === 0) return { ok: false, error: "items array required" };
 
   const { databases } = getAppwrite();
   const productsColl = env.APPWRITE_PRODUCTS_COLLECTION_ID;
 
   let computedTotal = 0;
-  const enrichedItems = [];
+  const simplifiedItems = []; // <- this will hold the simplified shape you requested
 
-  // iterate through items and normalize
   for (const itRaw of items) {
     let it = itRaw;
-    // If item is string -> productId
     if (typeof it === "string") {
       it = { productId: it, quantity: 1 };
     } else if (typeof it === "object" && it !== null) {
-      // try to find product id in common fields
-      const pid =
-        it.productId ??
-        it.product_id ??
-        it.product ??
-        it.id ??
-        it.$id ??
-        it._id ??
-        null;
+      const pid = it.productId ?? it.product_id ?? it.product ?? it.id ?? it.$id ?? null;
       const qty = Number(it.quantity ?? it.qty ?? it.q ?? 1) || 1;
       it = { productId: pid, quantity: qty };
     } else {
       return { ok: false, error: "Invalid item shape" };
     }
 
-    if (!it.productId) {
-      return { ok: false, error: "each item must include productId (or id/$id)" };
-    }
+    if (!it.productId) return { ok: false, error: "each item must include productId" };
 
-    // fetch product doc
+    // fetch product doc to compute price and get name/category
     let productDoc = null;
     try {
       productDoc = await databases.getDocument(env.APPWRITE_DATABASE_ID, productsColl, String(it.productId));
@@ -193,31 +152,27 @@ async function createOrderAction(payload) {
       console.error("Product fetch failed:", it.productId, err && err.message ? err.message : err);
       productDoc = null;
     }
-
     if (!productDoc) return { ok: false, error: `Product not found: ${it.productId}` };
 
-    const unitPrice = Number(productDoc.price ?? productDoc.pricePerPiece ?? productDoc.price_per_piece ?? 0);
+    const unitPrice = Number(productDoc.price ?? productDoc.pricePerPiece ?? productDoc.price_per_piece ?? 0) || 0;
     const qty = Number(it.quantity ?? 1) || 1;
     const lineTotal = unitPrice * qty;
     computedTotal += lineTotal;
 
-    enrichedItems.push({
-      productId: String(it.productId),
-      quantity: qty,
-      unitPrice,
-      lineTotal,
-      productSnapshot: {
-        $id: productDoc.$id,
-        productName: productDoc.productName ?? productDoc.name ?? null,
-        category: productDoc.category ?? null,
-      },
+    // simplified item format requested by you:
+    simplifiedItems.push({
+      $id: String(productDoc.$id),
+      productName: productDoc.productName ?? productDoc.name ?? null,
+      category: productDoc.category ?? null,
+      lineTotal: Number(lineTotal),
+      // note: intentionally NOT including quantity/unitPrice/productSnapshot per your request
     });
   }
 
   const totalToUse = computedTotal;
   if (!totalToUse || Number(totalToUse) <= 0) return { ok: false, error: "Invalid total computed from products" };
 
-  // Create Razorpay order
+  // create razorpay order
   const razorpay = new Razorpay({
     key_id: env.RAZORPAY_KEY_ID,
     key_secret: env.RAZORPAY_KEY_SECRET,
@@ -242,10 +197,10 @@ async function createOrderAction(payload) {
     return { ok: false, error: "Razorpay create failed: " + (err?.message || String(err)) };
   }
 
-  // Save order doc to Appwrite
+  // save order doc in Appwrite with simplified items array (stringified)
   const rawDocPayload = {
     userId,
-    items: JSON.stringify(enrichedItems),
+    items: JSON.stringify(simplifiedItems), // store as string field (orders collection expects string type)
     subtotal: Number(totalToUse),
     totalAmount: Number(totalToUse),
     currency,
@@ -344,20 +299,8 @@ async function verifyPaymentAction(payload) {
 /* -------------------------------------------------------------------------- */
 async function handleAction(body) {
   const b = body || {};
-  // The payload might be nested in different places; unify into top-level object
-  const actionFromBody = (b.action || (b.payload && b.payload.action) || (b.req && b.req.body && (() => {
-    // try parse wrapper
-    try {
-      const maybe = tryParseJSON(b.req.body);
-      if (maybe && maybe.action) return maybe.action;
-      if (maybe && maybe.payload && maybe.payload.action) return maybe.payload.action;
-    } catch (e) {}
-    return null;
-  })()) ) || null;
-
-  // also accept lower/upper case
+  const actionFromBody = (b.action || (b.payload && b.payload.action) || null) || null;
   const action = actionFromBody ? String(actionFromBody).toLowerCase() : null;
-  // payload can be many shapes; pass through whole body and function will normalize
   if (action === "verifypayment" || action === "verifyPayment") return await verifyPaymentAction(b);
   return await createOrderAction(b);
 }
@@ -367,15 +310,11 @@ async function handleAction(body) {
 /* -------------------------------------------------------------------------- */
 async function runHandler(rawArg, rawRes) {
   console.log("=== Razorpay Function Start ===");
-
-  // debug available env keys (filtered)
   try {
     const keys = Object.keys(process.env || {}).filter(k => /APPWRITE|RAZORPAY/i.test(k));
     console.log("DEBUG: available env keys (filtered):", keys);
     console.log("DEBUG: APPWRITE_PRODUCTS_COLLECTION_ID value:", process.env.APPWRITE_PRODUCTS_COLLECTION_ID);
-  } catch (e) {
-    console.warn("DEBUG env listing error:", e && e.message ? e.message : e);
-  }
+  } catch (e) { console.warn("DEBUG env listing error:", e && e.message ? e.message : e); }
 
   try { checkEnv(); } catch (err) {
     console.error("ENV missing:", err && err.message ? err.message : err);
@@ -385,7 +324,6 @@ async function runHandler(rawArg, rawRes) {
     return out;
   }
 
-  // Parse input robustly
   let input = {};
   try {
     input = extractInput(rawArg) || {};
@@ -415,7 +353,7 @@ async function runHandler(rawArg, rawRes) {
 
 module.exports = async function (req, res) {
   return runHandler(req, res);
-};
+}
 
 // Local testing support
 if (require.main === module) {
