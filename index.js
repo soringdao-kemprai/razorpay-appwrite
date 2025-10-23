@@ -15,6 +15,7 @@ const env = process.env;
 /* -------------------------------------------------------------------------- */
 function checkEnv() {
   const required = [
+    "APRWRITE_PRODUCT_ID",
     "RAZORPAY_KEY_ID",
     "RAZORPAY_KEY_SECRET",
     "APPWRITE_ENDPOINT",
@@ -22,7 +23,7 @@ function checkEnv() {
     "APPWRITE_API_KEY",
     "APPWRITE_DATABASE_ID",
     "APPWRITE_ORDERS_COLLECTION_ID",
-    "APRWRITE_PRODUCT_ID", // NEW
+     // NEW
   ];
   const missing = required.filter((k) => !env[k]);
   if (missing.length) throw new Error("Missing env: " + missing.join(", "));
