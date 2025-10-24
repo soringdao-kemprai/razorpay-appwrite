@@ -1,7 +1,7 @@
 // index.js - Appwrite Function: createOrder (sync) + verifyPayment (robust)
 // Requires env vars:
 // RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, APPWRITE_ENDPOINT, APPWRITE_PROJECT, APPWRITE_API_KEY,
-// APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID
+// APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID, APPWRITE_PRODUCTS_COLLECTION_ID (optional)
 
 const { Client, Databases, ID, Query } = require("node-appwrite");
 const Razorpay = require("razorpay");
@@ -59,12 +59,12 @@ function generateSignature(orderId, paymentId, secret) {
 }
 
 const allowedFields = [
-  "userId","items","subtotal","mrpTotal","discountTotal","totalItems","totalAmount","currency","shippingAddress",
+  "userId","items","subtotal","totalAmount","currency","shippingAddress",
   "paymentStatus","paymentProvider","paymentReference","razorpayOrderId",
   "razorpayOrderObj","razorpayPaymentId","razorpaySignature",
+  // new fields we allow through
+  "mrpTotal","discountTotal","totalItems"
 ];
-
-
 
 function computeTotalFromItems(items) {
   if (!items || !Array.isArray(items)) return 0;
@@ -77,61 +77,94 @@ function computeTotalFromItems(items) {
   return total;
 }
 
+/**
+ * Enrich items: ensure productName, images, mrp exist in each item snapshot.
+ * If productId present and fields missing, try fetch from products collection.
+ */
+async function enrichItemsWithProductDocs(items) {
+  if (!items || !Array.isArray(items)) return items;
+  const { databases } = getAppwrite();
+  const PRODS_COLL = env.APPWRITE_PRODUCTS_COLLECTION_ID ?? process.env.APPWRITE_PRODUCTS_COLLECTION_ID ?? null;
+  // If we don't have products collection env var, just return items (no enrichment)
+  if (!PRODS_COLL) return items;
+
+  // collect ids to fetch
+  const idsToFetch = new Set();
+  for (const it of items) {
+    const pid = it?.productId ?? it?.$id ?? it?.id ?? null;
+    if (!pid) continue;
+    // only fetch if missing key fields
+    if (!it.productName || !it.images || it.mrp == null) idsToFetch.add(String(pid));
+  }
+  if (idsToFetch.size === 0) return items;
+
+  const fetched = {};
+  // fetch each product doc (we could batch, but Appwrite SDK doesn't support multi-get)
+  await Promise.all(Array.from(idsToFetch).map(async (pid) => {
+    try {
+      const p = await databases.getDocument(env.APPWRITE_DATABASE_ID, PRODS_COLL, pid);
+      if (p && p.$id) fetched[pid] = p;
+    } catch (e) {
+      // ignore not found
+    }
+  }));
+
+  // create enriched copy
+  const enriched = items.map((it) => {
+    const pid = it?.productId ?? it?.$id ?? it?.id ?? null;
+    if (!pid) return it;
+    const prod = fetched[pid];
+    if (!prod) return it;
+    const out = Object.assign({}, it);
+    if (!out.productName) {
+      out.productName = prod.productName ?? prod.name ?? out.productName ?? "";
+    }
+    if (!out.images || (Array.isArray(out.images) && out.images.length === 0) || typeof out.images === "string" && out.images.length===0) {
+      if (Array.isArray(prod.images) && prod.images.length > 0) out.images = prod.images;
+      else if (typeof prod.images === "string" && prod.images) out.images = [prod.images];
+    }
+    if (out.mrp == null) {
+      out.mrp = prod.mrp != null ? Number(prod.mrp) : (prod.price != null ? Number(prod.price) : (out.price != null ? Number(out.price) : 0));
+    }
+    return out;
+  });
+
+  return enriched;
+}
+
 /* ---------- createOrder (synchronous DB save) ---------- */
 async function createOrderAction(payload) {
   const { userId } = payload || {};
   if (!userId) return { ok: false, error: "userId required" };
 
-  // parse items safely (string or array)
-  let itemsRaw = payload.items ?? [];
-  let itemsArr = [];
-  try {
-    if (typeof itemsRaw === "string") {
-      const parsed = tryParseJSON(itemsRaw);
-      if (Array.isArray(parsed)) itemsArr = parsed;
-      else itemsArr = [];
-    } else if (Array.isArray(itemsRaw)) {
-      itemsArr = itemsRaw;
-    } else {
-      // try deep parse
-      itemsArr = Array.isArray(payload.items) ? payload.items : [];
-    }
-  } catch {
-    itemsArr = [];
+  // items may be array of snapshots or JSON string
+  let items = payload.items ?? [];
+  if (typeof items === "string") {
+    try { items = JSON.parse(items); } catch { items = []; }
   }
-
-  // Ensure each item includes consistent fields (normalize minimally)
-  itemsArr = itemsArr.map((it) => {
-    const productId = it?.productId ?? it?.$id ?? it?.id ?? null;
-    return {
-      productId,
-      productName: it?.productName ?? it?.name ?? null,
-      quantity: Number(it.quantity ?? 0),
-      price: it.price != null ? Number(it.price) : (it.unitPrice != null ? Number(it.unitPrice) : 0),
-      mrp: it.mrp != null ? Number(it.mrp) : (it.price != null ? Number(it.price) : 0),
-      images: Array.isArray(it.images) ? it.images : (it.images ? [it.images] : []),
-      unit: it.unit ?? null,
-      ...it,
-    };
-  });
-
   const shippingAddress = payload.shippingAddress ?? {};
   const currency = payload.currency ?? "INR";
+
   const subtotalProvided = payload.subtotal;
   const totalProvided = payload.totalAmount;
 
-  // compute saleTotal, mrpTotal, discountTotal, totalItems from itemsArr
-  const saleTotal = itemsArr.reduce((s, it) => s + (Number(it.price ?? 0) * Number(it.quantity ?? 0)), 0);
-  const mrpTotal = itemsArr.reduce((s, it) => s + (Number(it.mrp ?? it.price ?? 0) * Number(it.quantity ?? 0)), 0);
-  const discountTotal = Math.max(0, mrpTotal - saleTotal);
-  const totalItems = itemsArr.reduce((s, it) => s + (Number(it.quantity ?? 0)), 0);
+  // allow explicit mrpTotal / discountTotal / totalItems (optional)
+  const mrpTotal = payload.mrpTotal != null ? Number(payload.mrpTotal) : null;
+  const discountTotal = payload.discountTotal != null ? Number(payload.discountTotal) : null;
+  const totalItems = payload.totalItems != null ? Number(payload.totalItems) : null;
+
+  // Enrich items server-side if product collection available
+  try {
+    items = await enrichItemsWithProductDocs(items);
+  } catch (e) {
+    console.warn("enrichItemsWithProductDocs failed:", e);
+  }
 
   let totalToUse = null;
   if (totalProvided != null && !Number.isNaN(Number(totalProvided))) totalToUse = Number(totalProvided);
   else if (subtotalProvided != null && !Number.isNaN(Number(subtotalProvided))) totalToUse = Number(subtotalProvided);
   else {
-    // Prefer the saleTotal computed from items if not provided
-    const computed = computeTotalFromItems(itemsArr);
+    const computed = computeTotalFromItems(items);
     totalToUse = computed || 0;
   }
 
@@ -159,13 +192,11 @@ async function createOrderAction(payload) {
     return { ok: false, error: "Razorpay did not return an order id" };
   }
 
+  // Save a snapshot of items in DB as JSON string (so we can render order summary offline)
   const rawDocPayload = {
     userId,
-    items: typeof itemsArr === "string" ? itemsArr : JSON.stringify(itemsArr),
-    subtotal: Number(subtotalProvided ?? saleTotal),
-    mrpTotal: Number(mrpTotal),
-    discountTotal: Number(discountTotal),
-    totalItems: Number(totalItems),
+    items: typeof items === "string" ? items : JSON.stringify(items),
+    subtotal: Number(subtotalProvided ?? totalToUse),
     totalAmount: Number(totalToUse),
     currency,
     shippingAddress: typeof shippingAddress === "string" ? shippingAddress : JSON.stringify(shippingAddress),
@@ -176,11 +207,18 @@ async function createOrderAction(payload) {
     razorpayOrderObj: JSON.stringify(rOrder),
     razorpayPaymentId: null,
     razorpaySignature: null,
+    // store new totals if provided
+    mrpTotal: mrpTotal != null ? Number(mrpTotal) : (mrpTotal === null ? undefined : undefined),
+    discountTotal: discountTotal != null ? Number(discountTotal) : (discountTotal === null ? undefined : undefined),
+    totalItems: totalItems != null ? Number(totalItems) : (totalItems === null ? undefined : undefined),
   };
 
+  // whitelist fields to save
   const docPayload = {};
   for (const k of Object.keys(rawDocPayload)) {
+    if (rawDocPayload[k] === undefined) continue;
     if (allowedFields.includes(k)) docPayload[k] = rawDocPayload[k];
+    else docPayload[k] = rawDocPayload[k]; // allow extra fields
   }
 
   try {
