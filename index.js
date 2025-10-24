@@ -60,8 +60,8 @@ function generateSignature(orderId, paymentId, secret) {
 
 const allowedFields = [
   "userId","items","subtotal","totalAmount","currency","shippingAddress",
-  "paymentStatus","paymentProvider",
-  "razorpayOrderObj",
+  "paymentStatus","paymentProvider","paymentReference","razorpayOrderId",
+  "razorpayOrderObj","razorpayPaymentId","razorpaySignature",
 ];
 
 function computeTotalFromItems(items) {
