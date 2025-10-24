@@ -59,7 +59,7 @@ function generateSignature(orderId, paymentId, secret) {
 }
 
 const allowedFields = [
-  "userId","items","subtotal","totalAmount","currency","shippingAddress",
+  "userId","items","subtotal","mrpTotal","discountTotal","totalItems","totalAmount","currency","shippingAddress",
   "paymentStatus","paymentProvider","paymentReference","razorpayOrderId",
   "razorpayOrderObj","razorpayPaymentId","razorpaySignature",
 ];
@@ -80,17 +80,56 @@ async function createOrderAction(payload) {
   const { userId } = payload || {};
   if (!userId) return { ok: false, error: "userId required" };
 
-  const items = payload.items ?? [];
+  // parse items safely (string or array)
+  let itemsRaw = payload.items ?? [];
+  let itemsArr = [];
+  try {
+    if (typeof itemsRaw === "string") {
+      const parsed = tryParseJSON(itemsRaw);
+      if (Array.isArray(parsed)) itemsArr = parsed;
+      else itemsArr = [];
+    } else if (Array.isArray(itemsRaw)) {
+      itemsArr = itemsRaw;
+    } else {
+      // try deep parse
+      itemsArr = Array.isArray(payload.items) ? payload.items : [];
+    }
+  } catch {
+    itemsArr = [];
+  }
+
+  // Ensure each item includes consistent fields (normalize minimally)
+  itemsArr = itemsArr.map((it) => {
+    const productId = it?.productId ?? it?.$id ?? it?.id ?? null;
+    return {
+      productId,
+      productName: it?.productName ?? it?.name ?? null,
+      quantity: Number(it.quantity ?? 0),
+      price: it.price != null ? Number(it.price) : (it.unitPrice != null ? Number(it.unitPrice) : 0),
+      mrp: it.mrp != null ? Number(it.mrp) : (it.price != null ? Number(it.price) : 0),
+      images: Array.isArray(it.images) ? it.images : (it.images ? [it.images] : []),
+      unit: it.unit ?? null,
+      ...it,
+    };
+  });
+
   const shippingAddress = payload.shippingAddress ?? {};
   const currency = payload.currency ?? "INR";
   const subtotalProvided = payload.subtotal;
   const totalProvided = payload.totalAmount;
 
+  // compute saleTotal, mrpTotal, discountTotal, totalItems from itemsArr
+  const saleTotal = itemsArr.reduce((s, it) => s + (Number(it.price ?? 0) * Number(it.quantity ?? 0)), 0);
+  const mrpTotal = itemsArr.reduce((s, it) => s + (Number(it.mrp ?? it.price ?? 0) * Number(it.quantity ?? 0)), 0);
+  const discountTotal = Math.max(0, mrpTotal - saleTotal);
+  const totalItems = itemsArr.reduce((s, it) => s + (Number(it.quantity ?? 0)), 0);
+
   let totalToUse = null;
   if (totalProvided != null && !Number.isNaN(Number(totalProvided))) totalToUse = Number(totalProvided);
   else if (subtotalProvided != null && !Number.isNaN(Number(subtotalProvided))) totalToUse = Number(subtotalProvided);
   else {
-    const computed = computeTotalFromItems(items);
+    // Prefer the saleTotal computed from items if not provided
+    const computed = computeTotalFromItems(itemsArr);
     totalToUse = computed || 0;
   }
 
@@ -120,8 +159,11 @@ async function createOrderAction(payload) {
 
   const rawDocPayload = {
     userId,
-    items: typeof items === "string" ? items : JSON.stringify(items),
-    subtotal: Number(subtotalProvided ?? totalToUse),
+    items: typeof itemsArr === "string" ? itemsArr : JSON.stringify(itemsArr),
+    subtotal: Number(subtotalProvided ?? saleTotal),
+    mrpTotal: Number(mrpTotal),
+    discountTotal: Number(discountTotal),
+    totalItems: Number(totalItems),
     totalAmount: Number(totalToUse),
     currency,
     shippingAddress: typeof shippingAddress === "string" ? shippingAddress : JSON.stringify(shippingAddress),
