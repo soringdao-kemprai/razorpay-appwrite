@@ -1,8 +1,4 @@
 // index.js - Appwrite Function: createOrder (sync) + verifyPayment (robust)
-// Requires env vars:
-// RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, APPWRITE_ENDPOINT, APPWRITE_PROJECT, APPWRITE_API_KEY,
-// APPWRITE_DATABASE_ID, APPWRITE_ORDERS_COLLECTION_ID, APPWRITE_PRODUCTS_COLLECTION_ID (optional)
-
 const { Client, Databases, ID, Query } = require("node-appwrite");
 const Razorpay = require("razorpay");
 const crypto = require("crypto");
@@ -63,7 +59,9 @@ const allowedFields = [
   "paymentStatus","paymentProvider","paymentReference","razorpayOrderId",
   "razorpayOrderObj","razorpayPaymentId","razorpaySignature",
   // new fields we allow through
-  "mrpTotal","discountTotal","totalItems"
+  "mrpTotal","discountTotal","totalItems",
+  // shipping phone extracted from shippingAddress
+  "shippingPhone"
 ];
 
 function computeTotalFromItems(items) {
@@ -119,7 +117,7 @@ async function enrichItemsWithProductDocs(items) {
     if (!out.productName) {
       out.productName = prod.productName ?? prod.name ?? out.productName ?? "";
     }
-    if (!out.images || (Array.isArray(out.images) && out.images.length === 0) || typeof out.images === "string" && out.images.length===0) {
+    if (!out.images || (Array.isArray(out.images) && out.images.length === 0) || (typeof out.images === "string" && out.images.length===0)) {
       if (Array.isArray(prod.images) && prod.images.length > 0) out.images = prod.images;
       else if (typeof prod.images === "string" && prod.images) out.images = [prod.images];
     }
@@ -142,7 +140,40 @@ async function createOrderAction(payload) {
   if (typeof items === "string") {
     try { items = JSON.parse(items); } catch { items = []; }
   }
-  const shippingAddress = payload.shippingAddress ?? {};
+
+  // shippingAddress may be string (legacy) or object { text, phone }
+  let rawShipping = payload.shippingAddress ?? {};
+  let shippingObj = null;
+  let shippingAddressText = "";
+  let shippingPhone = null;
+
+  if (typeof rawShipping === "string") {
+    // try to parse JSON string first
+    const parsed = tryParseJSON(rawShipping);
+    if (parsed && typeof parsed === "object") {
+      shippingObj = parsed;
+      shippingAddressText = JSON.stringify(parsed);
+    } else {
+      // store the raw string as the address text
+      shippingObj = { text: rawShipping };
+      shippingAddressText = rawShipping;
+    }
+  } else if (rawShipping && typeof rawShipping === "object") {
+    shippingObj = rawShipping;
+    try {
+      shippingAddressText = JSON.stringify(rawShipping);
+    } catch {
+      shippingAddressText = String(rawShipping.text ?? "");
+    }
+  } else {
+    shippingObj = {};
+    shippingAddressText = "";
+  }
+
+  // extract phone if present in shippingObj
+  shippingPhone = shippingObj.phone ?? shippingObj.phoneNumber ?? shippingObj.contact ?? null;
+  if (typeof shippingPhone === "number") shippingPhone = String(shippingPhone);
+
   const currency = payload.currency ?? "INR";
 
   const subtotalProvided = payload.subtotal;
@@ -199,7 +230,9 @@ async function createOrderAction(payload) {
     subtotal: Number(subtotalProvided ?? totalToUse),
     totalAmount: Number(totalToUse),
     currency,
-    shippingAddress: typeof shippingAddress === "string" ? shippingAddress : JSON.stringify(shippingAddress),
+    // store shippingAddress as JSON string (legacy-compatible) and also extract shippingPhone separately
+    shippingAddress: shippingAddressText,
+    shippingPhone: shippingPhone ? String(shippingPhone) : undefined,
     paymentStatus: "created",
     paymentProvider: "razorpay",
     paymentReference: null,
@@ -213,12 +246,12 @@ async function createOrderAction(payload) {
     totalItems: totalItems != null ? Number(totalItems) : (totalItems === null ? undefined : undefined),
   };
 
-  // whitelist fields to save
+  // whitelist fields to save (but still allow extra fields for flexibility)
   const docPayload = {};
   for (const k of Object.keys(rawDocPayload)) {
     if (rawDocPayload[k] === undefined) continue;
-    if (allowedFields.includes(k)) docPayload[k] = rawDocPayload[k];
-    else docPayload[k] = rawDocPayload[k]; // allow extra fields
+    // prefer to keep allowedFields but allow extra fields as before — keep previous behavior
+    docPayload[k] = rawDocPayload[k];
   }
 
   try {
